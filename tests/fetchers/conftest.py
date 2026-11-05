@@ -1,6 +1,5 @@
 """Shared pytest fixtures for fetcher tests."""
 
-import socket
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -63,13 +62,6 @@ class _RedirectHandler(BaseHTTPRequestHandler):
         pass  # Suppress log output
 
 
-def _find_free_port() -> int:
-    """Find a free TCP port on localhost."""
-    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
-        s.bind(("127.0.0.1", 0))
-        return s.getsockname()[1]
-
-
 import pytest  # noqa: E402
 
 
@@ -80,8 +72,8 @@ def redirect_server():
     Yields the base URL (e.g. ``http://127.0.0.1:12345``) that tests can use.
     The server is shut down after all tests in the module complete.
     """
-    port = _find_free_port()
-    server = ThreadingHTTPServer(("127.0.0.1", port), _RedirectHandler)
+    server = ThreadingHTTPServer(("127.0.0.1", 0), _RedirectHandler)
+    port = server.server_address[1]
     thread = threading.Thread(target=server.serve_forever, daemon=True)
     thread.start()
     try:
