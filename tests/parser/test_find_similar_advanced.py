@@ -101,3 +101,59 @@ class TestFindSimilarAdvanced:
         assert "Beta" not in texts
         # Gamma's extra attribute dilutes the score (4.0 / 5) - the intentional penalty
         assert "Gamma" not in texts
+
+
+class TestZeroSimilarityThreshold:
+    @pytest.mark.parametrize("reference_attributes", ["", 'href="/alpha"'])
+    @pytest.mark.parametrize("threshold, expected", [(0, ["Beta"]), (0.2, [])])
+    def test_zero_threshold_without_scored_reference_attributes(self, reference_attributes, threshold, expected):
+        """Mirror the upstream zero-check regression through the public API."""
+        page = Selector(f'<div><a {reference_attributes}>Alpha</a><a href="/beta" class="sale">Beta</a></div>')
+        similar = page.css("a")[0].find_similar(similarity_threshold=threshold)
+        assert [element.text for element in similar] == expected
+
+    @pytest.mark.parametrize("threshold, expected", [(0, ["Beta", "Gamma"]), (0.01, [])])
+    def test_explicit_ignored_attributes_and_candidate_order(self, threshold, expected):
+        page = Selector(
+            '<div><a class="reference" data-key="a">Alpha</a>'
+            '<a class="other" data-key="b" title="sale">Beta</a>'
+            '<span title="sale">wrong tag</span>'
+            '<a title="offer">Gamma</a></div>'
+        )
+        similar = page.css("a")[0].find_similar(similarity_threshold=threshold, ignore_attributes=("class", "data-key"))
+        assert [element.text for element in similar] == expected
+
+    @pytest.mark.parametrize("threshold", [0, 0.2, 1])
+    def test_both_elements_without_attributes_remain_a_full_match(self, threshold):
+        page = Selector("<div><a>Alpha</a><a>Beta</a></div>")
+        assert [element.text for element in page.css("a")[0].find_similar(similarity_threshold=threshold)] == ["Beta"]
+
+    @pytest.mark.parametrize("match_text", [False, True])
+    @pytest.mark.parametrize("threshold", [0, 0.2])
+    def test_text_matching_is_an_independent_scored_check(self, match_text, threshold):
+        page = Selector('<div><a>AAAA</a><a class="candidate">AAAA</a><a class="candidate">ZZZZ</a></div>')
+        similar = page.css("a")[0].find_similar(similarity_threshold=threshold, match_text=match_text)
+        expected = ["AAAA", "ZZZZ"] if threshold == 0 else (["AAAA"] if match_text else [])
+        assert [element.text for element in similar] == expected
+
+    @pytest.mark.parametrize(
+        "threshold, expected",
+        [
+            (0, ["Exact", "Half", "Zero"]),
+            (0.2, ["Exact", "Half"]),
+            (0.5, ["Exact", "Half"]),
+            (0.51, ["Exact"]),
+            (1, ["Exact"]),
+        ],
+    )
+    def test_attribute_rich_scores_and_threshold_boundaries(self, threshold, expected):
+        page = Selector(
+            '<div><a class="AAAA" data-key="BBBB">Reference</a>'
+            '<a class="AAAA" data-key="BBBB">Exact</a>'
+            '<a class="AAAA" data-key="ZZZZ">Half</a>'
+            '<a class="ZZZZ" data-key="YYYY">Zero</a></div>'
+        )
+        reference = page.css("a")[0]
+        similar = reference.find_similar(similarity_threshold=threshold, ignore_attributes=())
+        assert [element.text for element in similar] == expected
+        assert [element.text for element in reference.find_similar(ignore_attributes=())] == ["Exact", "Half"]
