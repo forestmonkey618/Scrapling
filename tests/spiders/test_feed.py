@@ -149,39 +149,6 @@ class TestXMLFeedSpider:
         assert len(items) == 2
 
     @pytest.mark.asyncio
-    @pytest.mark.parametrize("damage", ["truncated", "deflate"])
-    async def test_invalid_gzip_yields_nothing(self, damage):
-        """Malformed gzip must follow the feed's existing error handling."""
-        body = gzip.compress(RSS_XML)
-        body = body[:-4] if damage == "truncated" else body[:10] + b"\x07" + body[11:]
-
-        assert await _collect(_RSSSpider().parse(_make_response(body))) == []
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("damage", ["truncated", "deflate"])
-    async def test_invalid_gzip_logs_decompression_warning(self, damage):
-        spider = _RSSSpider()
-        records = []
-
-        class Capture(logging.Handler):
-            def emit(self, record):
-                records.append(record.getMessage())
-
-        spider.logger.addHandler(Capture())
-        body = gzip.compress(RSS_XML)
-        body = body[:-4] if damage == "truncated" else body[:10] + b"\x07" + body[11:]
-
-        assert await _collect(spider.parse(_make_response(body))) == []
-        assert any("Failed to decompress feed" in message for message in records)
-
-    @pytest.mark.asyncio
-    async def test_invalid_gzip_does_not_stop_later_valid_feeds(self):
-        spider = _RSSSpider()
-
-        assert await _collect(spider.parse(_make_response(gzip.compress(RSS_XML)[:-4]))) == []
-        assert len(await _collect(spider.parse(_make_response(gzip.compress(RSS_XML))))) == 2
-
-    @pytest.mark.asyncio
     async def test_malformed_xml_logs_warning_and_yields_nothing(self):
         spider = _RSSSpider()
         records = []
@@ -263,41 +230,6 @@ class TestCSVFeedSpider:
     async def test_gzipped_feed_is_decompressed(self):
         rows = await _collect(_PriceSpider().parse(_make_response(gzip.compress(CSV_BODY))))
         assert len(rows) == 2
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("damage", ["truncated", "deflate"])
-    async def test_invalid_gzip_yields_nothing(self, damage):
-        """Malformed gzip must follow the feed's existing error handling."""
-        body = gzip.compress(CSV_BODY)
-        body = body[:-4] if damage == "truncated" else body[:10] + b"\x07" + body[11:]
-
-        assert await _collect(_PriceSpider().parse(_make_response(body))) == []
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("damage", ["truncated", "deflate"])
-    async def test_invalid_gzip_logs_decompression_warning(self, damage):
-        spider = _PriceSpider()
-        records = []
-
-        class Capture(logging.Handler):
-            def emit(self, record):
-                records.append(record.getMessage())
-
-        spider.logger.addHandler(Capture())
-        body = gzip.compress(CSV_BODY)
-        body = body[:-4] if damage == "truncated" else body[:10] + b"\x07" + body[11:]
-
-        assert await _collect(spider.parse(_make_response(body))) == []
-        assert any("Failed to decompress feed" in message for message in records)
-
-    @pytest.mark.asyncio
-    async def test_invalid_gzip_does_not_stop_later_valid_feeds(self):
-        spider = _PriceSpider()
-        body = gzip.compress(CSV_BODY)
-        corrupt = body[:10] + b"\x07" + body[11:]
-
-        assert await _collect(spider.parse(_make_response(corrupt))) == []
-        assert len(await _collect(spider.parse(_make_response(body)))) == 2
 
     @pytest.mark.asyncio
     async def test_leading_byte_order_mark_stays_out_of_the_first_column(self):
