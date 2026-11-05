@@ -575,3 +575,131 @@ class TestPrefetch:
         await mgr.prefetch([], "s1")
 
         assert len(fetch_fn.calls) == 0
+
+
+class TestDomainFetchSynchronization:
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("outcome", ["success", "server_error", "network_error"])
+    async def test_same_domain_shares_fetch_and_cached_decisions(self, outcome):
+        calls = []
+        release = asyncio.Event()
+        started = [asyncio.Event() for _ in range(6)]
+
+        async def fetch(url, sid):
+            calls.append((url, sid))
+            await release.wait()
+            if outcome == "network_error":
+                raise OSError("injected fetch failure")
+            body = b"User-agent: *\nDisallow: /private/\nAllow: /private/public\nCrawl-delay: 2\nRequest-rate: 1/10\n"
+            return MockResponse(status=200 if outcome == "success" else 503, body=body)
+
+        manager = RobotsTxtManager(fetch)
+
+        async def check(index):
+            started[index].set()
+            path = "/private/" if index % 2 else "/private/public"
+            return await manager.can_fetch(f"https://example.com{path}", f"s{index}")
+
+        tasks = [asyncio.create_task(check(i)) for i in range(6)]
+        try:
+            await asyncio.wait_for(asyncio.gather(*(event.wait() for event in started)), 5)
+        finally:
+            release.set()
+            results = await asyncio.wait_for(asyncio.gather(*tasks), 5)
+        assert len(calls) == 1
+        assert calls[0][0] == "https://example.com/robots.txt"
+        assert results == ([True, False] * 3 if outcome == "success" else [False] * 6)
+        assert await manager.can_fetch("https://example.com/other", "later") is (outcome == "success")
+        assert await manager.get_delay_directives("https://example.com/", "later") == (
+            (2.0, (1, 10)) if outcome == "success" else (None, None)
+        )
+        assert len(calls) == 1
+
+    @pytest.mark.asyncio
+    async def test_different_domains_enter_fetch_before_either_finishes(self):
+        entered = {domain: asyncio.Event() for domain in ("alpha.test", "beta.test")}
+        release = asyncio.Event()
+        calls = []
+
+        async def fetch(url, sid):
+            calls.append(url)
+            domain = url.split("/")[2]
+            entered[domain].set()
+            await release.wait()
+            return MockResponse(body=ROBOTS_BASIC.encode())
+
+        manager = RobotsTxtManager(fetch)
+        tasks = [asyncio.create_task(manager.can_fetch(f"https://{domain}/", "s")) for domain in entered]
+        try:
+            await asyncio.wait_for(asyncio.gather(*(event.wait() for event in entered.values())), 5)
+            assert all(not task.done() for task in tasks)
+        finally:
+            release.set()
+            results = await asyncio.wait_for(asyncio.gather(*tasks), 5)
+        assert results == [True, True]
+        assert set(calls) == {f"https://{domain}/robots.txt" for domain in entered}
+
+    @pytest.mark.asyncio
+    async def test_cancelled_fetch_releases_domain_for_waiter_to_retry(self):
+        entered = asyncio.Event()
+        waiter_started = asyncio.Event()
+        calls = []
+
+        async def fetch(url, sid):
+            calls.append(sid)
+            if sid == "owner":
+                entered.set()
+                await asyncio.Event().wait()
+            return MockResponse(body=ROBOTS_BASIC.encode())
+
+        manager = RobotsTxtManager(fetch)
+        owner = asyncio.create_task(manager.can_fetch("https://example.com/", "owner"))
+        await asyncio.wait_for(entered.wait(), 5)
+
+        async def waiting_request():
+            waiter_started.set()
+            return await manager.can_fetch("https://example.com/admin/", "waiter")
+
+        waiter = asyncio.create_task(waiting_request())
+        await asyncio.wait_for(waiter_started.wait(), 5)
+        owner.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await owner
+        assert await asyncio.wait_for(waiter, 5) is False
+        assert calls == ["owner", "waiter"]
+        assert await manager.can_fetch("https://example.com/", "cached") is True
+        assert calls == ["owner", "waiter"]
+
+    @pytest.mark.asyncio
+    async def test_cancelled_waiter_does_not_cancel_shared_fetch(self):
+        entered = asyncio.Event()
+        release = asyncio.Event()
+        waiter_started = asyncio.Event()
+        calls = []
+
+        async def fetch(url, sid):
+            calls.append(sid)
+            entered.set()
+            await release.wait()
+            return MockResponse(body=ROBOTS_BASIC.encode())
+
+        manager = RobotsTxtManager(fetch)
+        owner = asyncio.create_task(manager.can_fetch("https://example.com/", "owner"))
+        await asyncio.wait_for(entered.wait(), 5)
+
+        async def waiting_request():
+            waiter_started.set()
+            return await manager.can_fetch("https://example.com/", "waiter")
+
+        waiter = asyncio.create_task(waiting_request())
+        await asyncio.wait_for(waiter_started.wait(), 5)
+        waiter.cancel()
+        try:
+            with pytest.raises(asyncio.CancelledError):
+                await waiter
+            assert not owner.done()
+        finally:
+            release.set()
+            assert await asyncio.wait_for(owner, 5) is True
+        assert await manager.can_fetch("https://example.com/admin/", "cached") is False
+        assert calls == ["owner"]
