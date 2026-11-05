@@ -1,6 +1,6 @@
 from time import time
 from pathlib import Path
-from asyncio import sleep as asyncio_sleep, Lock
+from asyncio import CancelledError, Lock, sleep as asyncio_sleep
 from contextlib import contextmanager, asynccontextmanager, suppress
 
 from patchright.sync_api import Page
@@ -16,6 +16,7 @@ from patchright.async_api import (
     BrowserContext as AsyncBrowserContext,
 )
 
+from scrapling.core.utils import log
 from scrapling.parser import Selector
 from scrapling.engines._browsers._page import PageInfo, PagePool
 from scrapling.engines._browsers._network import NetworkRecorder
@@ -95,19 +96,40 @@ class SyncSession:
             return
 
         self.close_pages()
-        if self.context:
-            self.context.close()
+
+        errors: list[Exception] = []
+        if self.context is not None:
+            try:
+                self.context.close()
+            except Exception as exc:  # noqa: BLE001 - keep releasing remaining resources
+                errors.append(exc)
             self.context = None
 
-        if self.browser:
-            self.browser.close()
+        if self.browser is not None:
+            try:
+                self.browser.close()
+            except Exception as exc:  # noqa: BLE001 - keep releasing remaining resources
+                errors.append(exc)
             self.browser = None
 
-        if self.playwright:
-            self.playwright.stop()
-            self.playwright = None  # pyright: ignore
+        if self.playwright is not None:
+            try:
+                self.playwright.stop()
+            except Exception as exc:  # noqa: BLE001 - keep releasing remaining resources
+                errors.append(exc)
+            self.playwright = None
 
         self._is_alive = False
+
+        if errors:
+            primary = errors[0]
+            for secondary in errors[1:]:
+                log.warning("Secondary cleanup failure during session close: %r", secondary)
+                try:
+                    primary.add_note(f"Secondary cleanup failure: {type(secondary).__name__}: {secondary}")
+                except AttributeError:
+                    pass  # Python < 3.11 does not support exception notes
+            raise primary
 
     def __enter__(self):
         self.start()
@@ -291,8 +313,12 @@ class AsyncSession:
     async def close_pages(self) -> None:
         """Close every open tab in the session's pool. The next request opens a fresh tab."""
         for page_info in self.page_pool.clear():
-            with suppress(Exception):
+            try:
                 await cast(AsyncPage, page_info.page).close()
+            except CancelledError:
+                raise
+            except Exception:
+                pass
 
     async def close(self):
         """Close all resources"""
@@ -300,20 +326,54 @@ class AsyncSession:
         if not self._is_alive:  # pragma: no cover
             return
 
-        await self.close_pages()
-        if self.context:
-            await self.context.close()
-            self.context = None  # pyright: ignore
+        cancelled = False
+        try:
+            await self.close_pages()
+        except CancelledError:
+            cancelled = True
 
-        if self.browser:
-            await self.browser.close()
+        errors: list[Exception] = []
+
+        if self.context is not None:
+            try:
+                await self.context.close()
+            except CancelledError:
+                cancelled = True
+            except Exception as exc:  # noqa: BLE001 - keep releasing remaining resources
+                errors.append(exc)
+            self.context = None
+
+        if self.browser is not None:
+            try:
+                await self.browser.close()
+            except CancelledError:
+                cancelled = True
+            except Exception as exc:  # noqa: BLE001 - keep releasing remaining resources
+                errors.append(exc)
             self.browser = None
 
-        if self.playwright:
-            await self.playwright.stop()
-            self.playwright = None  # pyright: ignore
+        if self.playwright is not None:
+            try:
+                await self.playwright.stop()
+            except CancelledError:
+                cancelled = True
+            except Exception as exc:  # noqa: BLE001 - keep releasing remaining resources
+                errors.append(exc)
+            self.playwright = None
 
         self._is_alive = False
+
+        if cancelled:
+            raise CancelledError()
+        if errors:
+            primary = errors[0]
+            for secondary in errors[1:]:
+                log.warning("Secondary cleanup failure during session close: %r", secondary)
+                try:
+                    primary.add_note(f"Secondary cleanup failure: {type(secondary).__name__}: {secondary}")
+                except AttributeError:
+                    pass  # Python < 3.11 does not support exception notes
+            raise primary
 
     async def __aenter__(self):
         await self.start()
