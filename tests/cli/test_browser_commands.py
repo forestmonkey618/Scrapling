@@ -167,3 +167,49 @@ def test_shell_fetch_updates_page_history() -> None:
     assert shell.page is pages[-1]
     assert shell.pages == pages[-5:]
     assert shell.shell.user_ns == {"page": pages[-1], "response": pages[-1], "pages": pages[-5:]}
+
+
+@pytest.mark.parametrize(
+    "flags, expected_ads, expected_ai",
+    [
+        (["--ai-targeted"], True, True),
+        (["--ai-targeted", "--block-ads"], True, True),
+        (["--ai-targeted", "--no-block-ads"], True, True),
+        ([], False, False),
+        (["--block-ads"], True, False),
+        (["--no-block-ads"], False, False),
+    ],
+)
+def test_fetch_ai_targeted_ad_blocking_precedence(tmp_path, flags, expected_ads, expected_ai):
+    """AI targeting overrides ad flags; ordinary fetch preserves its options."""
+    from scrapling.core.shell import Convertor
+
+    output = tmp_path / "page.txt"
+    page = Selector("<html><body><p>Content</p><b>Other</b></body></html>")
+    with (
+        patch.object(StealthyFetcher, "fetch", return_value=page) as fetch,
+        patch.object(Convertor, "write_content_to_file", wraps=Convertor.write_content_to_file) as write,
+    ):
+        result = CliRunner().invoke(
+            cli.main,
+            ["extract", "fetch", "https://example.com", str(output), "--css-selector", "p", *flags],
+        )
+    assert result.exit_code == 0, result.output
+    fetch.assert_called_once()
+    assert fetch.call_args.args == ("https://example.com",)
+    assert fetch.call_args.kwargs["block_ads"] is expected_ads
+    assert "ai_targeted" not in fetch.call_args.kwargs
+    write.assert_called_once_with(page, str(output), "p", main_content_only=expected_ai)
+    assert output.read_text() == "Content"
+
+
+@pytest.mark.parametrize("extension, expected", [("txt", "Content"), ("md", "Content"), ("html", "<p>Content</p>")])
+def test_fetch_ai_targeted_preserves_extraction_formats(tmp_path, extension, expected):
+    output = tmp_path / f"page.{extension}"
+    with patch.object(StealthyFetcher, "fetch", return_value=Selector("<p>Content</p><b>Other</b>")):
+        result = CliRunner().invoke(
+            cli.main,
+            ["extract", "fetch", "https://example.com", str(output), "--ai-targeted", "--css-selector", "p"],
+        )
+    assert result.exit_code == 0, result.output
+    assert output.read_text() == expected
