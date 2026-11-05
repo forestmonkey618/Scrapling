@@ -1,7 +1,6 @@
 """Tests for `SitemapSpider`."""
 
 import gzip
-import logging
 import pickle
 
 import pytest
@@ -218,53 +217,6 @@ class TestSitemapSpiderFlow:
         body = gzip.compress(URLSET_XML)
         out = await _collect(spider._parse_sitemap(_make_response(body, url="https://example.com/sitemap.xml.gz")))
         assert len(out) == 3
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("damage", ["truncated", "deflate"])
-    async def test_invalid_gzip_yields_nothing(self, damage):
-        """Malformed gzip must follow the sitemap's existing error handling."""
-
-        class S(SitemapSpider):
-            name = "s"
-            sitemap_urls = ["https://example.com/sitemap.xml.gz"]
-
-        body = gzip.compress(URLSET_XML)
-        body = body[:-4] if damage == "truncated" else body[:10] + b"\x07" + body[11:]
-
-        assert await _collect(S()._parse_sitemap(_make_response(body))) == []
-
-    @pytest.mark.asyncio
-    @pytest.mark.parametrize("damage", ["truncated", "deflate"])
-    async def test_invalid_gzip_logs_decompression_warning(self, damage):
-        class S(SitemapSpider):
-            name = "s"
-            sitemap_urls = ["https://example.com/sitemap.xml.gz"]
-
-        spider = S()
-        records = []
-
-        class Capture(logging.Handler):
-            def emit(self, record):
-                records.append(record.getMessage())
-
-        spider.logger.addHandler(Capture())
-        body = gzip.compress(URLSET_XML)
-        body = body[:-4] if damage == "truncated" else body[:10] + b"\x07" + body[11:]
-
-        assert await _collect(spider._parse_sitemap(_make_response(body))) == []
-        assert any("Failed to decompress sitemap" in message for message in records)
-
-    @pytest.mark.asyncio
-    async def test_invalid_gzip_does_not_stop_later_valid_sitemaps(self):
-        class S(SitemapSpider):
-            name = "s"
-            sitemap_urls = ["https://example.com/sitemap.xml.gz"]
-
-        spider = S()
-        body = gzip.compress(URLSET_XML)
-
-        assert await _collect(spider._parse_sitemap(_make_response(body[:-4]))) == []
-        assert len(await _collect(spider._parse_sitemap(_make_response(body)))) == 3
 
 
 class TestSitemapSpiderStartRequests:

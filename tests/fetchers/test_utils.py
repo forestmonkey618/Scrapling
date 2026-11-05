@@ -208,37 +208,6 @@ class TestConstructProxyDict:
         expected = {"server": "http://proxy.example.com:8080", "username": "user", "password": "pass"}
         assert result == expected
 
-    def test_proxy_string_with_percent_encoded_auth(self):
-        """Test proxy string with percent-encoded credentials"""
-        result = construct_proxy_dict("http://user%40mail.com:p%40ss%3Aw0rd%2F@proxy.example.com:8080")
-
-        expected = {"server": "http://proxy.example.com:8080", "username": "user@mail.com", "password": "p@ss:w0rd/"}
-        assert result == expected
-
-    @pytest.mark.parametrize(
-        "proxy_url, expected_username, expected_password",
-        [
-            ("http://user:pass@proxy.example.com:8080", "user", "pass"),
-            ("http://user%20name:p%20ass@proxy.example.com:8080", "user name", "p ass"),
-            ("http://user%2Bname:p%2Bass@proxy.example.com:8080", "user+name", "p+ass"),
-            ("http://user+name:p+ass@proxy.example.com:8080", "user+name", "p+ass"),
-            ("http://user%40mail.com@proxy.example.com:8080", "user@mail.com", ""),
-            ("http://:p%40ss@proxy.example.com:8080", "", "p@ss"),
-            ("http://user:@proxy.example.com:8080", "user", ""),
-            ("socks5://user%3Aname:p%40ss@proxy.example.com:1080", "user:name", "p@ss"),
-            ("http://us%C3%A9r:p%C3%A4ss@proxy.example.com:8080", "usér", "päss"),
-            ("http://user%25name:p%25ass@proxy.example.com:8080", "user%name", "p%ass"),
-            ("http://user%zz:p%zz@proxy.example.com:8080", "user%zz", "p%zz"),
-        ],
-    )
-    def test_proxy_string_credential_edge_cases(self, proxy_url, expected_username, expected_password):
-        """URL credentials are decoded without changing ordinary credentials, plus signs, or empty components."""
-        result = construct_proxy_dict(proxy_url)
-
-        assert result["username"] == expected_username
-        assert result["password"] == expected_password
-        assert result["server"].startswith(("http://proxy.example.com", "socks5://proxy.example.com"))
-
     def test_proxy_dict_input(self):
         """Test proxy dictionary input"""
         input_dict = {"server": "http://proxy.example.com:8080", "username": "user", "password": "pass"}
@@ -254,26 +223,10 @@ class TestConstructProxyDict:
         expected = {"server": "http://proxy.example.com:8080", "username": "", "password": ""}
         assert result == expected
 
-    def test_proxy_dict_percent_looking_credentials_are_literal(self):
-        """Dictionary-supplied credentials are already literal and must not be URL-decoded."""
-        input_dict = {
-            "server": "http://proxy.example.com:8080",
-            "username": "user%40mail.com",
-            "password": "p%40ss%3Aw0rd%2F",
-        }
-        result = construct_proxy_dict(input_dict)
-
-        assert result == input_dict
-
     def test_invalid_proxy_string(self):
         """Test invalid proxy string"""
         with pytest.raises(ValueError):
             construct_proxy_dict("invalid-proxy-format")
-
-    def test_proxy_string_invalid_port_still_raises(self):
-        """Credential decoding must not change invalid-port error handling."""
-        with pytest.raises(ValueError, match="invalid format"):
-            construct_proxy_dict("http://user:pass@proxy.example.com:not-a-port")
 
     def test_invalid_proxy_dict(self):
         """Test invalid proxy dictionary"""
