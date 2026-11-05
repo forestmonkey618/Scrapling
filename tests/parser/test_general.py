@@ -192,6 +192,123 @@ class TestFindByEscapedAttributes:
         assert page.find("a", title="one\ntwo").get_all_text() == "broken"
 
 
+@pytest.mark.parametrize(
+    "content",
+    [
+        "",
+        b"",
+        " \t\r\n",
+        b" \t\r\n",
+        b"\x00 \t\r\n\x00",
+        "<!DOCTYPE html>",
+        b"<!DOCTYPE html>",
+        "<!-- comment -->",
+        b"<!-- comment -->",
+    ],
+)
+@pytest.mark.parametrize("keep_comments", [False, True])
+def test_content_without_root_uses_empty_html(content, keep_comments):
+    """Inputs with no document element should support normal selector operations."""
+    url = "https://example.com/empty"
+    page = Selector(content, url=url, keep_comments=keep_comments)
+
+    assert page.tag == "html"
+    assert page.html_content == "<html></html>"
+    assert len(page.css("html")) == 1
+    assert page.xpath("//p") == []
+    assert page.get_all_text() == ""
+    assert page.body == content
+    assert page.url == url
+    assert page._root.base_url == url
+
+
+class TestRootlessHtmlSelectorOperations:
+    @pytest.mark.parametrize(
+        "content", ["<!--a--><!--b-->", "<?xml version='1.0'?>", "<!DOCTYPE html><!-- c -->", b"\x00\x00"]
+    )
+    @pytest.mark.parametrize("keep_comments", [False, True])
+    def test_other_rootless_inputs_fall_back_to_empty_html(self, content, keep_comments):
+        page = Selector(content, keep_comments=keep_comments)
+        assert page.tag == "html"
+        assert page.html_content == "<html></html>"
+        assert page.get_all_text() == ""
+
+    @pytest.mark.parametrize("keep_comments", [False, True])
+    def test_css_and_xpath_operations_work_on_the_empty_root(self, keep_comments):
+        page = Selector(b" \t\r\n", keep_comments=keep_comments)
+        assert page.css("html")[0].tag == "html"
+        assert page.xpath("//html")[0].tag == "html"
+        assert page.css("p") == []
+        assert page.xpath("//p") == []
+        assert page.find_all("p") == []
+
+    @pytest.mark.parametrize("keep_comments", [False, True])
+    def test_empty_root_exposes_neutral_tree_attributes(self, keep_comments):
+        page = Selector("<!-- c -->", keep_comments=keep_comments)
+        assert page.attrib == {}
+        assert page.children == []
+        assert page.parent is None
+        assert page.text == ""
+
+    @pytest.mark.parametrize("keep_comments", [False, True])
+    def test_base_url_is_preserved_and_usable_for_urljoin(self, keep_comments):
+        url = "https://example.com/empty"
+        page = Selector("<!DOCTYPE html>", url=url, keep_comments=keep_comments)
+        assert page.url == url
+        assert page._root.base_url == url
+        assert page.urljoin("/a") == "https://example.com/a"
+
+    def test_missing_url_still_yields_a_usable_empty_root(self):
+        page = Selector("<!-- c -->")
+        assert page.tag == "html"
+        assert page._root.base_url is None
+        assert page.urljoin("/a") == "/a"
+
+    @pytest.mark.parametrize(
+        "content",
+        [
+            "",
+            b"",
+            " \t\r\n",
+            b" \t\r\n",
+            b"\x00 \t\r\n\x00",
+            "<!DOCTYPE html>",
+            b"<!DOCTYPE html>",
+            "<!-- c -->",
+            b"<!-- c -->",
+        ],
+    )
+    def test_original_body_is_preserved_verbatim(self, content):
+        page = Selector(content)
+        assert page.tag == "html"
+        assert page.body == content
+        assert type(page.body) is type(content)
+
+    @pytest.mark.parametrize("as_bytes", [False, True])
+    @pytest.mark.parametrize("keep_comments", [False, True])
+    def test_valid_html_is_unaffected_by_the_rootless_fallback(self, as_bytes, keep_comments):
+        content = '<html><body><p class="message">ok</p><!--c--></body></html>'
+        if as_bytes:
+            content = content.encode()
+        url = "https://example.com/valid"
+        page = Selector(content, url=url, keep_comments=keep_comments)
+        assert page.tag == "html"
+        assert page.css("p.message")[0].get_all_text() == "ok"
+        assert [str(text) for text in page.xpath("//p/text()")] == ["ok"]
+        assert page.get_all_text() == "ok"
+        assert ("<!--c-->" in page.html_content) is keep_comments
+        assert page.body == content
+        assert page._root.base_url == url
+
+    @pytest.mark.parametrize("keep_comments", [False, True])
+    def test_comment_only_input_is_not_promoted_to_document_text(self, keep_comments):
+        page = Selector("<!-- secret -->", keep_comments=keep_comments)
+        assert page.tag == "html"
+        assert page.text == ""
+        assert page.get_all_text() == ""
+        assert "secret" not in page.html_content
+
+
 # Error Handling Tests
 class TestErrorHandling:
     def test_invalid_selector_initialization(self):
