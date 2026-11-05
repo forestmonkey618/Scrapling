@@ -52,6 +52,17 @@ _whitelisted = {
     "class_": "class",
     "for_": "for",
 }
+
+
+class XPathScalarError(ValueError):
+    """Raised when an XPath expression returns a scalar value instead of a node-set.
+
+    ``Selector.xpath()`` selects elements and text nodes. XPath 1.0 functions such as
+    ``count()``, ``boolean()``, and ``number()`` return scalars (float or bool), which
+    cannot be represented as ``Selector`` objects.
+    """
+
+
 _T = TypeVar("_T")
 
 
@@ -663,24 +674,41 @@ class Selector(SelectorsGeneration):
             return Selectors()
 
         try:
-            if elements := self._root.xpath(selector, **kwargs):
+            result = self._root.xpath(selector, **kwargs)
+
+            # XPath 1.0 may return scalars (string, number, boolean) instead of node-sets.
+            # Scalars are not element collections; handle them before the list logic.
+            if not isinstance(result, list):
+                if isinstance(result, _ElementUnicodeResult):
+                    # String result — wrap as a single text Selector.
+                    # An empty string means no text was found.
+                    if result:
+                        return self.__handle_elements([result])
+                    return Selectors()
+                # Numeric or boolean scalar — not representable as elements.
+                raise XPathScalarError(
+                    f"XPath expression {selector!r} returned a scalar value ({result!r}), "
+                    f"not a node-set. ``xpath()`` selects elements and text nodes only."
+                )
+
+            if result:
                 if not self.__adaptive_enabled and auto_save:
                     log.warning(
                         "Argument `auto_save` will be ignored because `adaptive` wasn't enabled on initialization. Check docs for more info."
                     )
                 elif self.__adaptive_enabled and auto_save:
-                    self.save(elements[0], identifier or selector)
+                    self.save(result[0], identifier or selector)
 
-                return self.__handle_elements(elements)
+                return self.__handle_elements(result)
             elif self.__adaptive_enabled:
                 if adaptive:
                     element_data = self.retrieve(identifier or selector)
                     if element_data:
-                        elements = self.relocate(element_data, percentage)
-                        if elements and auto_save:
-                            self.save(elements[0], identifier or selector)
+                        result = self.relocate(element_data, percentage)
+                        if result and auto_save:
+                            self.save(result[0], identifier or selector)
 
-                return self.__handle_elements(elements)
+                return self.__handle_elements(result)
             else:
                 if adaptive:
                     log.warning(
@@ -691,7 +719,7 @@ class Selector(SelectorsGeneration):
                         "Argument `auto_save` will be ignored because `adaptive` wasn't enabled on initialization. Check docs for more info."
                     )
 
-                return self.__handle_elements(elements)
+                return self.__handle_elements(result)
 
         except (
             SelectorError,
