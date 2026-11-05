@@ -1,5 +1,10 @@
 from asyncio import Lock
 
+from anyio import CancelScope
+from anyio.lowlevel import checkpoint_if_cancelled
+
+from scrapling.core.utils import log
+
 from scrapling.spiders.request import Request
 from scrapling.engines.static import _ASyncSessionLogic
 from scrapling.engines.toolbelt.convertor import Response
@@ -85,20 +90,49 @@ class SessionManager:
         if self._started:
             return
 
-        for sid, session in self._sessions.items():
-            if sid not in self._lazy_sessions and not session._is_alive:
-                await session.__aenter__()
+        opened: list[Session] = []
+        try:
+            for sid, session in self._sessions.items():
+                if sid not in self._lazy_sessions and not session._is_alive:
+                    await session.__aenter__()
+                    opened.append(session)
+        except BaseException:
+            # Only roll back sessions opened by this call, not pre-existing ones.
+            with CancelScope(shield=True):
+                for session in reversed(opened):
+                    try:
+                        await session.__aexit__(None, None, None)
+                    except BaseException:
+                        log.error("Session startup rollback failed", exc_info=True)
+            raise
 
         self._started = True
 
     async def close(self) -> None:
-        """Close all registered sessions."""
-        for sid, session in self._sessions.items():
-            if sid in self._lazy_sessions and not session._is_alive:
-                continue
-            _ = await session.__aexit__(None, None, None)
+        """Attempt every applicable close, then propagate failure (cancellation takes priority)."""
+        first_error: BaseException | None = None
+        try:
+            # Let cleanup proceed even inside an already-cancelled AnyIO scope.
+            with CancelScope(shield=True):
+                for sid, session in self._sessions.items():
+                    if not session._is_alive and (sid in self._lazy_sessions or not self._started):
+                        continue
+                    try:
+                        await session.__aexit__(None, None, None)
+                    except BaseException as error:
+                        log.error("Session shutdown failed", exc_info=True)
+                        if first_error is None or (
+                            isinstance(first_error, Exception) and not isinstance(error, Exception)
+                        ):
+                            # Cancellation/system exceptions take priority over ordinary failures.
+                            first_error = error
+        finally:
+            self._started = False
 
-        self._started = False
+        # Shielding must not consume cancellation from the caller's scope.
+        await checkpoint_if_cancelled()
+        if first_error is not None:
+            raise first_error
 
     async def fetch(self, request: Request) -> Response:
         sid = request.sid if request.sid else self.default_session_id
