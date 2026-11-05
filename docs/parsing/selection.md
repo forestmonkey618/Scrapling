@@ -88,6 +88,31 @@ page.xpath('//*[@class="product"]')[0].css('h1:contains("Phone")::text').get()
 ```
 Use `.//` for an XPath relative to the current element. A leading `//` searches the whole document, even after selecting a product.
 
+!!! warning "Scalar XPath results"
+
+    The `xpath()` method selects elements and text nodes only. XPath 1.0 functions
+    that return scalar values — such as `count()`, `boolean()`, `number()`, or `sum()`
+    — are not supported and raise a `XPathScalarError`.
+
+    ```python
+    # Supported: returns element Selectors
+    page.xpath('//h1')
+
+    # Supported: returns text Selectors (string scalar)
+    page.xpath('string(//h1)')
+
+    # Raises XPathScalarError: count() returns a number, not a node-set
+    page.xpath('count(//a)')
+    ```
+
+    To select elements that match a condition, use a predicate inside the XPath
+    expression instead of calling `boolean()`:
+
+    ```python
+    # Supported: returns anchor elements that have an href attribute
+    page.xpath('//a[@href]')
+    ```
+
 Another example
 
 All links that have 'image' in their 'href' attribute
