@@ -524,3 +524,125 @@ class TestSchedulerInFlight:
             fetchable.add((await restored.dequeue()).url)
 
         assert fetchable == {"https://example.com/A", "https://example.com/B"}
+
+
+class TestSchedulerDontFilterDedup:
+    """Test dont_filter behavior with duplicate detection (regression tests for _seen pollution)."""
+
+    @pytest.mark.asyncio
+    async def test_normal_then_normal_duplicate_rejected(self):
+        """A. Normal -> Normal: first accepted, second rejected."""
+        scheduler = Scheduler()
+        r1 = Request("https://example.com/page", sid="s1")
+        r2 = Request("https://example.com/page", sid="s1")
+
+        res1 = await scheduler.enqueue(r1)
+        res2 = await scheduler.enqueue(r2)
+
+        assert res1 is True
+        assert res2 is False
+        assert len(scheduler) == 1
+
+    @pytest.mark.asyncio
+    async def test_normal_then_dont_filter_both_accepted(self):
+        """B. Normal -> dont_filter=True: both accepted."""
+        scheduler = Scheduler()
+        r1 = Request("https://example.com/page", sid="s1")
+        r2 = Request("https://example.com/page", sid="s1", dont_filter=True)
+
+        res1 = await scheduler.enqueue(r1)
+        res2 = await scheduler.enqueue(r2)
+
+        assert res1 is True
+        assert res2 is True
+        assert len(scheduler) == 2
+
+    @pytest.mark.asyncio
+    async def test_dont_filter_then_normal_both_accepted(self):
+        """C. dont_filter=True -> Normal: both accepted (regression: dont_filter must not pollute _seen)."""
+        scheduler = Scheduler()
+        r1 = Request("https://example.com/page", sid="s1", dont_filter=True)
+        r2 = Request("https://example.com/page", sid="s1")
+
+        res1 = await scheduler.enqueue(r1)
+        res2 = await scheduler.enqueue(r2)
+
+        assert res1 is True
+        assert res2 is True
+        assert len(scheduler) == 2
+
+    @pytest.mark.asyncio
+    async def test_dont_filter_then_dont_filter_both_accepted(self):
+        """D. dont_filter=True -> dont_filter=True: both accepted."""
+        scheduler = Scheduler()
+        r1 = Request("https://example.com/page", sid="s1", dont_filter=True)
+        r2 = Request("https://example.com/page", sid="s1", dont_filter=True)
+
+        res1 = await scheduler.enqueue(r1)
+        res2 = await scheduler.enqueue(r2)
+
+        assert res1 is True
+        assert res2 is True
+        assert len(scheduler) == 2
+
+    @pytest.mark.asyncio
+    async def test_dont_filter_then_normal_then_normal_third_rejected(self):
+        """E. dont_filter=True -> Normal -> Normal: first two accepted, third rejected."""
+        scheduler = Scheduler()
+        r1 = Request("https://example.com/page", sid="s1", dont_filter=True)
+        r2 = Request("https://example.com/page", sid="s1")
+        r3 = Request("https://example.com/page", sid="s1")
+
+        res1 = await scheduler.enqueue(r1)
+        res2 = await scheduler.enqueue(r2)
+        res3 = await scheduler.enqueue(r3)
+
+        assert res1 is True
+        assert res2 is True
+        assert res3 is False
+        assert len(scheduler) == 2
+
+    @pytest.mark.asyncio
+    async def test_dont_filter_does_not_populate_seen(self):
+        """F. dont_filter=True does not change _seen size or contents."""
+        scheduler = Scheduler()
+        r1 = Request("https://example.com/page", sid="s1", dont_filter=True)
+
+        _, seen_before = scheduler.snapshot()
+        await scheduler.enqueue(r1)
+        _, seen_after = scheduler.snapshot()
+
+        assert seen_before == seen_after
+        assert len(seen_after) == 0
+
+    @pytest.mark.asyncio
+    async def test_normal_requests_populate_seen(self):
+        """G. Normal requests populate _seen."""
+        scheduler = Scheduler()
+        r1 = Request("https://example.com/page", sid="s1")
+
+        _, seen_before = scheduler.snapshot()
+        await scheduler.enqueue(r1)
+        _, seen_after = scheduler.snapshot()
+
+        assert len(seen_after) == 1
+        assert len(seen_after) > len(seen_before)
+
+    @pytest.mark.asyncio
+    async def test_dont_filter_bypass_request_dequeueable(self):
+        """Verify bypassed requests can actually be dequeued and processed."""
+        scheduler = Scheduler()
+        r1 = Request("https://example.com/page", sid="s1", dont_filter=True)
+        r2 = Request("https://example.com/page", sid="s1", dont_filter=True)
+
+        await scheduler.enqueue(r1)
+        await scheduler.enqueue(r2)
+
+        assert len(scheduler) == 2
+
+        dequeued1 = await scheduler.dequeue()
+        dequeued2 = await scheduler.dequeue()
+
+        assert dequeued1.url == "https://example.com/page"
+        assert dequeued2.url == "https://example.com/page"
+        assert scheduler.is_empty
