@@ -6,6 +6,7 @@ from asyncio import sleep as asyncio_sleep
 
 from curl_cffi.curl import CurlError
 from curl_cffi import CurlHttpVersion
+from curl_cffi.const import CurlFollow
 from curl_cffi.requests import (
     BrowserTypeLiteral,
     Session as CurlSession,
@@ -32,6 +33,15 @@ from ._browsers._types import RequestsSession, GetRequestParams, DataRequestPara
 from .toolbelt.fingerprints import generate_headers, __default_useragent__
 
 _NO_SESSION: Any = object()
+
+# Explicit mapping of documented follow_redirects strings to curl_cffi CurlFollow enum members.
+# Whitelisted to prevent future curl_cffi enum members from being silently accepted.
+_FOLLOW_REDIRECTS_STRINGS: Dict[str, CurlFollow] = {
+    "safe": CurlFollow.SAFE,
+    "all": CurlFollow.ALL,
+    "obeycode": CurlFollow.OBEYCODE,
+    "firstonly": CurlFollow.FIRSTONLY,
+}
 
 
 def _select_random_browser(impersonate: ImpersonateType) -> Optional[BrowserTypeLiteral]:
@@ -110,6 +120,21 @@ class _ConfigurationLogic(ABC):
         http3_enabled = self._get_param(method_kwargs, "http3", self._default_http3)
         stealth = self._get_param(method_kwargs, "stealth", self._stealth)
 
+        # Normalize string follow_redirects values to curl_cffi CurlFollow enum members.
+        # curl_cffi only accepts "safe" as a string; "all", "obeycode", and "firstonly"
+        # would otherwise reach int() and raise ValueError.
+        # Explicitly whitelist the four documented strings so that future curl_cffi
+        # enum members are not silently accepted.
+        _follow_redirects = self._get_param(method_kwargs, "follow_redirects", self._default_follow_redirects)
+        if isinstance(_follow_redirects, str):
+            _normalized = _FOLLOW_REDIRECTS_STRINGS.get(_follow_redirects.lower())
+            if _normalized is None:
+                raise ValueError(
+                    f"Invalid follow_redirects value {_follow_redirects!r}. "
+                    "Must be one of: 'safe', 'all', 'obeycode', 'firstonly', True, False."
+                )
+            _follow_redirects = _normalized
+
         final_args = {
             "url": url,
             # Curl automatically generates the suitable browser headers when you use `impersonate`
@@ -123,7 +148,7 @@ class _ConfigurationLogic(ABC):
             "proxy": self._get_param(method_kwargs, "proxy", self._default_proxy),
             "proxy_auth": self._get_param(method_kwargs, "proxy_auth", self._default_proxy_auth),
             "timeout": self._get_param(method_kwargs, "timeout", self._default_timeout),
-            "allow_redirects": self._get_param(method_kwargs, "follow_redirects", self._default_follow_redirects),
+            "allow_redirects": _follow_redirects,
             "max_redirects": self._get_param(method_kwargs, "max_redirects", self._default_max_redirects),
             "verify": self._get_param(method_kwargs, "verify", self._default_verify),
             "cert": self._get_param(method_kwargs, "cert", self._default_cert),
