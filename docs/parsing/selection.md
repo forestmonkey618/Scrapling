@@ -92,7 +92,7 @@ Use `.//` for an XPath relative to the current element. A leading `//` searches 
 
     The `xpath()` method selects elements and text nodes only. XPath 1.0 functions
     that return scalar values — such as `count()`, `boolean()`, `number()`, or `sum()`
-    — are not supported and raise a ``XPathScalarError``.
+    — are not supported and raise a `XPathScalarError`.
 
     ```python
     # Supported: returns element Selectors
@@ -105,12 +105,12 @@ Use `.//` for an XPath relative to the current element. A leading `//` searches 
     page.xpath('count(//a)')
     ```
 
-    To check whether elements exist, use a boolean predicate inside the XPath
+    To select elements that match a condition, use a predicate inside the XPath
     expression instead of calling `boolean()`:
 
     ```python
-    # Supported: returns elements that match the condition
-    page.xpath('//a[count(.) > 0]')
+    # Supported: returns anchor elements that have an href attribute
+    page.xpath('//a[@href]')
     ```
 
 Another example
