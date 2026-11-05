@@ -1,0 +1,44 @@
+name: Development tests
+
+on:
+  pull_request:
+    branches:
+      - scrapling-development
+  push:
+    branches:
+      - scrapling-development
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  non-browser-tests:
+    name: Non-browser tests (Python 3.11)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v6
+        with:
+          persist-credentials: false
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.11'
+
+      - name: Install test environment
+        run: |
+          python -m venv .venv
+          .venv/bin/python -m pip install -e '.[ai,shell]' -r tests/requirements.txt 'playwright==1.62.0' 'patchright==1.62.1'
+
+      - name: Check dependency consistency
+        run: .venv/bin/python -m pip check
+
+      - name: Run non-browser tests
+        run: .venv/bin/python -m pytest tests -m "not browser" -q --no-header -p no:cacheprovider
