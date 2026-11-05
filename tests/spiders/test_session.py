@@ -472,3 +472,274 @@ class TestSessionManagerFetch:
         call_kwargs = mock_client._make_request.call_args.kwargs
         assert "stealth" not in call_kwargs
         assert "stealthy_headers" not in call_kwargs
+
+
+class LifecycleSession(MockSession):
+    """Deterministic lifecycle failures without network or browser resources."""
+
+    def __init__(self, name, events, *, enter_error=None, exit_error=None, alive=False):
+        super().__init__(name)
+        self.events = events
+        self.enter_error = enter_error
+        self.exit_error = exit_error
+        self._is_alive = alive
+        self.enter_hook = None
+        self.exit_hook = None
+
+    async def __aenter__(self):
+        self.events.append(f"enter:{self.name}")
+        if self.enter_hook:
+            await self.enter_hook()
+        if self.enter_error:
+            raise self.enter_error
+        return await super().__aenter__()
+
+    async def __aexit__(self, *args):
+        self.events.append(f"exit:{self.name}")
+        if self.exit_hook:
+            await self.exit_hook()
+        if self.exit_error:
+            raise self.exit_error
+        if not self._is_alive:
+            raise RuntimeError("double close")
+        await super().__aexit__(*args)
+
+
+class TestLifecycleSafety:
+    @pytest.mark.asyncio
+    async def test_partial_start_rolls_back_only_new_sessions(self):
+        events = []
+        manager = SessionManager()
+        old = LifecycleSession("old", events, alive=True)
+        a = LifecycleSession("a", events)
+        b = LifecycleSession("b", events)
+        error = ValueError("startup")
+        bad = LifecycleSession("bad", events, enter_error=error)
+        lazy = LifecycleSession("lazy", events)
+        for session in (old, a, b, bad):
+            manager.add(session.name, session)
+        manager.add("lazy", lazy, lazy=True)
+        with pytest.raises(ValueError) as caught:
+            await manager.start()
+        assert caught.value is error
+        assert events == ["enter:a", "enter:b", "enter:bad", "exit:b", "exit:a"]
+        assert old._is_alive and not a._is_alive and not b._is_alive
+        assert not lazy._is_alive and not manager._started
+        bad.enter_error = None
+        await manager.start()
+        await manager.close()
+        assert not old._is_alive and not manager._started
+
+    @pytest.mark.asyncio
+    async def test_rollback_failure_preserves_startup_error_and_diagnostics(self, caplog):
+        events = []
+        manager = SessionManager()
+        a = LifecycleSession("a", events)
+        b = LifecycleSession("b", events, exit_error=RuntimeError("rollback failure"))
+        original = ValueError("original startup")
+        manager.add("a", a).add("b", b).add("bad", LifecycleSession("bad", events, enter_error=original))
+        with pytest.raises(ValueError) as caught:
+            await manager.start()
+        assert caught.value is original
+        assert events[-2:] == ["exit:b", "exit:a"]
+        assert not a._is_alive and b._is_alive and not manager._started
+        assert "rollback failure" in caplog.text
+        assert any(record.exc_info for record in caplog.records)
+        b.exit_error = None
+        await manager.close()
+        assert not b._is_alive
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("multiple", [False, True])
+    async def test_close_attempts_all_and_resets_state(self, multiple, caplog):
+        events = []
+        manager = SessionManager()
+        first = ValueError("first close")
+        sessions = [
+            LifecycleSession("a", events, exit_error=first),
+            LifecycleSession("b", events, exit_error=RuntimeError("second close") if multiple else None),
+            LifecycleSession("c", events),
+        ]
+        for session in sessions:
+            manager.add(session.name, session)
+        await manager.start()
+        with pytest.raises(ValueError) as caught:
+            await manager.close()
+        assert caught.value is first
+        assert events[-3:] == ["exit:a", "exit:b", "exit:c"]
+        assert not sessions[-1]._is_alive and not manager._started
+        if multiple:
+            assert "second close" in caplog.text
+        for session in sessions:
+            session.exit_error = None
+        await manager.close()
+        assert all(not session._is_alive for session in sessions)
+
+    @pytest.mark.asyncio
+    async def test_normal_context_lazy_and_repeated_calls(self):
+        from types import SimpleNamespace
+
+        events = []
+        manager = SessionManager()
+        eager = LifecycleSession("eager", events)
+        lazy = LifecycleSession("lazy", events)
+        unused = LifecycleSession("unused", events)
+
+        async def fetch(**kwargs):
+            return SimpleNamespace(meta={})
+
+        lazy.fetch = fetch
+        manager.add("eager", eager).add("lazy", lazy, lazy=True).add("unused", unused, lazy=True)
+        await manager.close()  # No session has been entered.
+        async with manager:
+            await manager.start()
+            assert events == ["enter:eager"]
+            await manager.fetch(Request("https://example.invalid/", sid="lazy"))
+            assert lazy._is_alive and not unused._is_alive
+        await manager.close()
+        assert events == ["enter:eager", "enter:lazy", "exit:eager", "exit:lazy"]
+        assert not manager._started
+        await manager.start()
+        await manager.close()
+        assert events[-2:] == ["enter:eager", "exit:eager"]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("phase", ["start", "close"])
+    async def test_asyncio_cancellation_attempts_remaining_cleanup(self, phase):
+        import asyncio
+
+        events = []
+        manager = SessionManager()
+        a = LifecycleSession("a", events)
+        b = LifecycleSession("b", events)
+        entered = asyncio.Event()
+
+        async def block():
+            entered.set()
+            await asyncio.Event().wait()
+
+        manager.add("a", a).add("b", b)
+        if phase == "start":
+            b.enter_hook = block
+        else:
+            await manager.start()
+            a.exit_hook = block
+        task = asyncio.create_task(manager.start() if phase == "start" else manager.close())
+        await entered.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        assert not manager._started
+        if phase == "start":
+            assert not a._is_alive and "exit:a" in events
+        else:
+            assert not b._is_alive and "exit:b" in events
+            a.exit_hook = None
+            await manager.close()
+            assert not a._is_alive
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("phase", ["start", "close"])
+    async def test_anyio_cancel_scope_allows_cleanup_and_preserves_cancellation(self, phase):
+        import anyio
+
+        events = []
+        manager = SessionManager()
+        a = LifecycleSession("a", events)
+        b = LifecycleSession("b", events)
+
+        async def cleanup_checkpoint():
+            await anyio.sleep(0)
+
+        a.exit_hook = cleanup_checkpoint
+        b.exit_hook = cleanup_checkpoint
+        manager.add("a", a).add("b", b)
+        if phase == "close":
+            await manager.start()
+        with anyio.CancelScope() as scope:
+
+            async def cancel_start():
+                scope.cancel()
+                await anyio.sleep(0)
+
+            if phase == "start":
+                b.enter_hook = cancel_start
+            else:
+                scope.cancel()
+            with pytest.raises(anyio.get_cancelled_exc_class()):
+                await (manager.start() if phase == "start" else manager.close())
+        assert not manager._started and not a._is_alive
+        if phase == "close":
+            assert not b._is_alive and events[-2:] == ["exit:a", "exit:b"]
+
+    @pytest.mark.asyncio
+    async def test_successful_multi_session_lifecycle(self):
+        events = []
+        manager = SessionManager()
+        sessions = [LifecycleSession(name, events) for name in ("a", "b", "c")]
+        for session in sessions:
+            manager.add(session.name, session)
+        async with manager:
+            await manager.start()
+            assert manager._started and all(session._is_alive for session in sessions)
+        await manager.close()
+        assert events == ["enter:a", "enter:b", "enter:c", "exit:a", "exit:b", "exit:c"]
+        assert not manager._started
+
+    @pytest.mark.asyncio
+    async def test_shutdown_cancellation_is_not_hidden_by_an_earlier_error(self, caplog):
+        import asyncio
+
+        events = []
+        manager = SessionManager()
+        cancellation = asyncio.CancelledError("cancel close")
+        manager.add("a", LifecycleSession("a", events, exit_error=ValueError("first error")))
+        manager.add("b", LifecycleSession("b", events, exit_error=cancellation))
+        c = LifecycleSession("c", events)
+        manager.add("c", c)
+        await manager.start()
+        with pytest.raises(asyncio.CancelledError) as caught:
+            await manager.close()
+        assert caught.value is cancellation
+        assert not c._is_alive and not manager._started
+        assert events[-3:] == ["exit:a", "exit:b", "exit:c"]
+        assert "first error" in caplog.text
+
+    @pytest.mark.asyncio
+    async def test_anyio_cancellation_during_shutdown_is_delivered_after_cleanup(self):
+        import anyio
+
+        events = []
+        manager = SessionManager()
+        a = LifecycleSession("a", events)
+        b = LifecycleSession("b", events)
+        manager.add("a", a).add("b", b)
+        await manager.start()
+        with anyio.CancelScope() as scope:
+
+            async def cancel_during_cleanup():
+                scope.cancel()
+                await anyio.sleep(0)
+
+            a.exit_hook = cancel_during_cleanup
+            with pytest.raises(anyio.get_cancelled_exc_class()):
+                await manager.close()
+        assert events[-2:] == ["exit:a", "exit:b"]
+        assert not a._is_alive and not b._is_alive and not manager._started
+
+    @pytest.mark.asyncio
+    async def test_cancelled_scope_is_not_masked_by_shutdown_error(self, caplog):
+        import anyio
+
+        events = []
+        manager = SessionManager()
+        a = LifecycleSession("a", events, exit_error=ValueError("close under cancellation"))
+        b = LifecycleSession("b", events)
+        manager.add("a", a).add("b", b)
+        await manager.start()
+        with anyio.CancelScope() as scope:
+            scope.cancel()
+            with pytest.raises(anyio.get_cancelled_exc_class()):
+                await manager.close()
+        assert not b._is_alive and not manager._started
+        assert "close under cancellation" in caplog.text
