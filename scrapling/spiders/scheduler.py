@@ -42,11 +42,12 @@ class Scheduler:
         """Add a request to the queue."""
         fingerprint = request.update_fingerprint(self._include_kwargs, self._include_headers, self._keep_fragments)
 
-        if not request.dont_filter and fingerprint in self._seen:
-            log.debug("Dropped duplicate request: %s", request)
-            return False
+        if not request.dont_filter:
+            if fingerprint in self._seen:
+                log.debug("Dropped duplicate request: %s", request)
+                return False
 
-        self._seen.add(fingerprint)
+            self._seen.add(fingerprint)
 
         # Negative priority so higher priority = dequeued first
         counter = next(self._counter)
