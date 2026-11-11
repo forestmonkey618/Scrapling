@@ -32,9 +32,17 @@ _NON_INHERITABLE_KWARGS = frozenset({"method", "data", "json", "params", "files"
 # Signals used by Response.next_page_url(), checked in strict precedence order.
 # Priority 1 (rel="next") is handled by attribute inspection; the text/aria sets
 # below are used for priorities 2 and 3.
-_NEXT_PAGE_TEXT_SIGNALS = frozenset({
-    "next", "›", ">", "»", "next page", "older", "newer",
-})
+_NEXT_PAGE_TEXT_SIGNALS = frozenset(
+    {
+        "next",
+        "›",
+        ">",
+        "»",
+        "next page",
+        "older",
+        "newer",
+    }
+)
 
 # Common URL query/path patterns that indicate a numbered page.
 _PAGE_NUMBER_URL_PATTERNS = (
@@ -227,7 +235,6 @@ class Response(Selector):
 
         :return: Absolute next-page URL, or ``None`` if no next page is detected.
         """
-        current_url = self.url
         seen: set[str] = set()
 
         for url in self._iter_rel_next_candidates():
@@ -273,9 +280,7 @@ class Response(Selector):
         ID reference whose referenced element's text content is resolved and used as
         the label (per the ARIA spec).
         """
-        for element in self.css(
-            "a[aria-label], a[aria-labelledby], area[aria-label], area[aria-labelledby]"
-        ):
+        for element in self.css("a[aria-label], a[aria-labelledby], area[aria-label], area[aria-labelledby]"):
             aria_label = element.attrib.get("aria-label")
             if aria_label:
                 label_text = str(aria_label)
