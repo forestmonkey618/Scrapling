@@ -2,6 +2,8 @@
 Functions related to custom types or type checking
 """
 
+import re
+from urllib.parse import urlparse
 from functools import lru_cache
 
 from scrapling.core.utils import log
@@ -26,6 +28,42 @@ if TYPE_CHECKING:
 
 
 _NON_INHERITABLE_KWARGS = frozenset({"method", "data", "json", "params", "files", "multipart"})
+
+# Signals used by Response.next_page_url(), checked in strict precedence order.
+# Priority 1 (rel="next") is handled by attribute inspection; the text/aria sets
+# below are used for priorities 2 and 3.
+_NEXT_PAGE_TEXT_SIGNALS = frozenset({
+    "next", "›", ">", "»", "next page", "older", "newer",
+})
+
+# Common URL query/path patterns that indicate a numbered page.
+_PAGE_NUMBER_URL_PATTERNS = (
+    re.compile(r"[?&]page=(\d+)(?:&|$)", re.IGNORECASE),
+    re.compile(r"[?&]p=(\d+)(?:&|$)", re.IGNORECASE),
+    re.compile(r"/page/(\d+)/", re.IGNORECASE),
+)
+
+
+def _extract_page_number(url: str) -> Optional[int]:
+    """Extract a page number from a URL, or ``None`` if no page pattern is found."""
+    for pattern in _PAGE_NUMBER_URL_PATTERNS:
+        match = pattern.search(url)
+        if match:
+            return int(match.group(1))
+    return None
+
+
+def _origin_key(url: str) -> tuple:
+    """Return a comparable (scheme, hostname, port) tuple for origin comparison.
+
+    Default ports (80 for http, 443 for https) are normalized so that
+    ``http://example.com/`` and ``http://example.com:80/`` compare equal.
+    """
+    parsed = urlparse(url)
+    port = parsed.port
+    if port is None:
+        port = 443 if parsed.scheme.lower() == "https" else 80
+    return (parsed.scheme.lower(), parsed.hostname.lower() if parsed.hostname else "", port)
 
 
 class Response(Selector):
@@ -168,6 +206,177 @@ class Response(Selector):
             meta={**(self.meta or {}), **(meta or {})},
             **session_kwargs,
         )
+
+    def next_page_url(self) -> Optional[str]:
+        """Return the absolute URL of the next page, or ``None`` if none is detected.
+
+        Detection uses deterministic signals in precedence order (first match wins):
+
+        1. ``rel="next"`` on ``<link>``, ``<a>``, or ``<area>`` elements — multi-token
+           and case-insensitive (e.g. ``rel="NEXT"``, ``rel="next archive"``).
+        2. Accessibility labels (``aria-label`` / ``aria-labelledby``) containing a
+           next-page keyword.
+        3. Link text matching a next-page keyword ("Next", "›", ">", "»", "next page",
+           "older", "newer").
+        4. Numbered pagination URLs whose page number exceeds the current page's number.
+
+        Within each priority level, the first candidate in document order wins.
+
+        The method only *detects* — it does not navigate, issue network requests, or
+        modify crawler state. Use :meth:`follow` to navigate to the returned URL.
+
+        :return: Absolute next-page URL, or ``None`` if no next page is detected.
+        """
+        current_url = self.url
+        seen: set[str] = set()
+
+        for url in self._iter_rel_next_candidates():
+            resolved = self._validate_next_url(url, seen)
+            if resolved:
+                return resolved
+
+        for url in self._iter_aria_label_candidates():
+            resolved = self._validate_next_url(url, seen)
+            if resolved:
+                return resolved
+
+        for url in self._iter_text_candidates():
+            resolved = self._validate_next_url(url, seen)
+            if resolved:
+                return resolved
+
+        for url in self._iter_page_number_candidates():
+            resolved = self._validate_next_url(url, seen)
+            if resolved:
+                return resolved
+
+        return None
+
+    def _iter_rel_next_candidates(self):
+        """Yield href URLs from elements with rel containing 'next' (case-insensitive,
+        multi-token). Priority 1 signal."""
+        for element in self.css("a[rel], area[rel], link[rel]"):
+            rel = element.attrib.get("rel")
+            if not rel:
+                continue
+            tokens = str(rel).lower().split()
+            if "next" in tokens:
+                href = element.attrib.get("href")
+                if href:
+                    yield str(href)
+
+    def _iter_aria_label_candidates(self):
+        """Yield href URLs from elements with a next-page aria-label/aria-labelledby.
+        Priority 2 signal.
+
+        ``aria-label`` is used directly as the label text. ``aria-labelledby`` is an
+        ID reference whose referenced element's text content is resolved and used as
+        the label (per the ARIA spec).
+        """
+        for element in self.css(
+            "a[aria-label], a[aria-labelledby], area[aria-label], area[aria-labelledby]"
+        ):
+            aria_label = element.attrib.get("aria-label")
+            if aria_label:
+                label_text = str(aria_label)
+            else:
+                labelledby = element.attrib.get("aria-labelledby")
+                if not labelledby:
+                    continue
+                label_text = self._resolve_aria_labelledby(labelledby)
+            if not label_text:
+                continue
+            label_lower = label_text.lower()
+            if any(signal in label_lower for signal in _NEXT_PAGE_TEXT_SIGNALS):
+                href = element.attrib.get("href")
+                if href:
+                    yield str(href)
+
+    def _resolve_aria_labelledby(self, label_id_ref: str) -> str:
+        """Resolve aria-labelledby ID reference(s) to concatenated element text.
+
+        ``aria-labelledby`` contains space-separated element IDs. Each referenced
+        element's text content is looked up and joined with spaces.
+        """
+        parts: list[str] = []
+        for ref_id in str(label_id_ref).split():
+            ref_id = ref_id.strip()
+            if not ref_id:
+                continue
+            # Use XPath variable binding to avoid CSS injection in the ID reference.
+            for ref_element in self.xpath("*[@id=$ref_id]", ref_id=ref_id):
+                text = str(ref_element.get_all_text(strip=True))
+                if text:
+                    parts.append(text)
+                    break
+        return " ".join(parts)
+
+    def _iter_text_candidates(self):
+        """Yield href URLs from <a> elements whose text matches a next-page keyword.
+        Priority 3 signal."""
+        for element in self.css("a"):
+            text = str(element.get_all_text(strip=True)).lower()
+            if not text:
+                continue
+            if any(text == signal or text.startswith(signal + " ") for signal in _NEXT_PAGE_TEXT_SIGNALS):
+                href = element.attrib.get("href")
+                if href:
+                    yield str(href)
+
+    def _iter_page_number_candidates(self):
+        """Yield href URLs whose page number exceeds the current page's number.
+        Priority 4 (conservative) signal."""
+        current_page = _extract_page_number(self.url)
+        if current_page is None:
+            return
+        for element in self.css("a[href]"):
+            href = str(element.attrib.get("href"))
+            page_num = _extract_page_number(href)
+            if page_num is not None and page_num > current_page:
+                yield href
+
+    def _validate_next_url(self, href: str, seen: set[str]) -> Optional[str]:
+        """Resolve and validate a candidate next-page URL.
+
+        Returns the absolute URL if valid, or ``None`` if it should be skipped.
+        """
+        current_url = self.url
+
+        if not href or not href.strip():
+            return None
+
+        href = href.strip()
+
+        # Reject fragment-only navigation.
+        if href == "#" or href.startswith("#"):
+            return None
+
+        # Resolve relative URLs against the response URL.
+        absolute = str(self.urljoin(href))
+
+        # Reject empty or fragment-containing results.
+        if not absolute or "#" in absolute:
+            return None
+
+        # Accept HTTP/HTTPS only.
+        lower = absolute.lower()
+        if not (lower.startswith("http://") or lower.startswith("https://")):
+            return None
+
+        # Reject cross-origin URLs (same-origin restriction).
+        if _origin_key(absolute) != _origin_key(current_url):
+            return None
+
+        # Reject self-links (ignore trailing slash and bare query differences).
+        if absolute.rstrip("/?") == current_url.rstrip("/?"):
+            return None
+
+        # Reject duplicates.
+        if absolute in seen:
+            return None
+        seen.add(absolute)
+
+        return absolute
 
     def __str__(self) -> str:
         return f"<{self.status} {self.url}>"
