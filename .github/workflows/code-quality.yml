@@ -5,6 +5,7 @@ on:
     branches:
       - main
       - dev
+      - scrapling-development
     paths-ignore:
       - '*.md'
       - '**/*.md'
@@ -17,6 +18,7 @@ on:
     branches:
       - main
       - dev
+      - scrapling-development
     paths-ignore:
       - '*.md'
       - '**/*.md'
