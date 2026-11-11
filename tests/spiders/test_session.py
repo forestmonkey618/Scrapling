@@ -613,10 +613,11 @@ class TestLifecycleSafety:
         a = LifecycleSession("a", events)
         b = LifecycleSession("b", events)
         entered = asyncio.Event()
+        release = asyncio.Event()
 
         async def block():
             entered.set()
-            await asyncio.Event().wait()
+            await release.wait()
 
         manager.add("a", a).add("b", b)
         if phase == "start":
@@ -629,14 +630,18 @@ class TestLifecycleSafety:
         task.cancel()
         with pytest.raises(asyncio.CancelledError):
             await task
-        assert not manager._started
         if phase == "start":
+            assert not manager._started
             assert not a._is_alive and "exit:a" in events
         else:
-            assert not b._is_alive and "exit:b" in events
-            a.exit_hook = None
+            # Shared-task model: cleanup continues in the background task
+            # after the caller is cancelled.  Release the blocked session and
+            # await the shared task to completion.
+            release.set()
             await manager.close()
-            assert not a._is_alive
+            assert not manager._started
+            assert not a._is_alive and not b._is_alive
+            assert events[-2:] == ["exit:a", "exit:b"]
 
     @pytest.mark.asyncio
     @pytest.mark.parametrize("phase", ["start", "close"])
@@ -668,6 +673,11 @@ class TestLifecycleSafety:
                 scope.cancel()
             with pytest.raises(anyio.get_cancelled_exc_class()):
                 await (manager.start() if phase == "start" else manager.close())
+        if phase == "close":
+            # Shared-task model: cleanup continues in the background task
+            # after the caller is cancelled.  Await its completion outside
+            # the cancelled scope.
+            await manager.close()
         assert not manager._started and not a._is_alive
         if phase == "close":
             assert not b._is_alive and events[-2:] == ["exit:a", "exit:b"]
@@ -724,6 +734,10 @@ class TestLifecycleSafety:
             a.exit_hook = cancel_during_cleanup
             with pytest.raises(anyio.get_cancelled_exc_class()):
                 await manager.close()
+        # Shared-task model: cleanup continues in the background task after
+        # the caller is cancelled.  Await its completion outside the cancelled
+        # scope so cancellation is delivered after cleanup finishes.
+        await manager.close()
         assert events[-2:] == ["exit:a", "exit:b"]
         assert not a._is_alive and not b._is_alive and not manager._started
 
@@ -741,5 +755,12 @@ class TestLifecycleSafety:
             scope.cancel()
             with pytest.raises(anyio.get_cancelled_exc_class()):
                 await manager.close()
+        # Shared-task model: cleanup continues in the background task after
+        # the caller is cancelled.  The shared task ran session __aexit__ for
+        # both sessions: session b closed successfully, session a failed with
+        # ValueError (logged).  _close_done is False because cleanup failed,
+        # so a second close() retries and the failure is observable again.
+        with pytest.raises(ValueError, match="close under cancellation"):
+            await manager.close()
         assert not b._is_alive and not manager._started
         assert "close under cancellation" in caplog.text

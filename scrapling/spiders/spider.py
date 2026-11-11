@@ -1,5 +1,6 @@
 import signal
 import logging
+from contextlib import aclosing
 from pathlib import Path
 from abc import ABC, abstractmethod
 
@@ -312,8 +313,10 @@ class Spider(ABC):
         token = set_logger(self.logger)
         try:
             self._engine = CrawlerEngine(self, self._session_manager, self.crawldir, self._interval)
-            async for item in self._engine:
-                yield item
+            iterator = self._engine.__aiter__()
+            async with aclosing(iterator):
+                async for item in iterator:
+                    yield item
         finally:
             self._engine = None
             reset_logger(token)

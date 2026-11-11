@@ -1,3 +1,4 @@
+import asyncio
 import json
 import pprint
 from pathlib import Path
@@ -360,6 +361,7 @@ class CrawlerEngine:
         self.paused = False
         self._pause_requested = False
         self._force_stop = False
+        self._stream_on_close_called = False
         self.stats = CrawlStats(start_time=anyio.current_time())
         self._domain_limiters.clear()
         if self._robots_manager:
@@ -439,6 +441,7 @@ class CrawlerEngine:
 
                 finished = True
             finally:
+                self._stream_on_close_called = True
                 await self.spider.on_close()
                 # Clean up checkpoint files only on successful completion (not paused, not crashed)
                 if finished and not self.paused and self._checkpoint_system_enabled:
@@ -468,13 +471,39 @@ class CrawlerEngine:
         async def run():
             try:
                 await self.crawl()
+            except BaseException:
+                # crawl() was abandoned due to consumer exit (task cancelled)
+                # or failed. Run cleanup if crawl() did not already call
+                # on_close() (cancelled before entering its cleanup finally).
+                # Close sessions with asyncio.shield() to protect cleanup
+                # from re-delivered CancelledError.
+                if not self._stream_on_close_called:
+                    await self.spider.on_close()
+                try:
+                    await asyncio.shield(self.session_manager.close())
+                except asyncio.CancelledError:
+                    pass
+                except Exception as e:
+                    log.error("Session cleanup failed", exc_info=e)
+                raise
             finally:
                 await send.aclose()
 
-        async with create_task_group() as tg:
-            tg.start_soon(run)
+        task = asyncio.create_task(run())
+        try:
+            async for item in recv:
+                yield item
+        finally:
+            if not task.done():
+                task.cancel()
+            # Always await the producer task so cleanup completes and
+            # exceptions are retrieved rather than silently lost.
             try:
-                async for item in recv:
-                    yield item
-            except EndOfStream:
-                pass
+                await task
+            except asyncio.CancelledError:
+                # Propagate cancellation only if the current (consumer) task
+                # has a pending external cancellation. If cancelling() is 0,
+                # the CancelledError came from our own task.cancel() and
+                # should be swallowed so normal aclose() completes.
+                if asyncio.current_task().cancelling() > 0:
+                    raise
