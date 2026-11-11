@@ -1,5 +1,7 @@
 """Tests for the CrawlerEngine class."""
 
+import asyncio
+import logging
 import tempfile
 from pathlib import Path
 
@@ -8,6 +10,7 @@ import pytest
 
 from scrapling.spiders.engine import CrawlerEngine, _dump
 from scrapling.spiders.request import Request
+from scrapling.spiders.spider import Spider
 from scrapling.spiders.robotstxt import RobotsTxtManager
 from scrapling.spiders.session import SessionManager
 from scrapling.spiders.scheduler import Scheduler
@@ -24,7 +27,9 @@ from scrapling.core._types import Any, Dict, Set, AsyncGenerator
 class MockResponse:
     """Minimal Response stand-in."""
 
-    def __init__(self, status: int = 200, body: bytes = b"ok", url: str = "https://example.com", encoding: str = "utf-8"):
+    def __init__(
+        self, status: int = 200, body: bytes = b"ok", url: str = "https://example.com", encoding: str = "utf-8"
+    ):
         self.status = status
         self.body = body
         self.url = url
@@ -67,6 +72,18 @@ class ErrorSession(MockSession):
 
     async def fetch(self, url: str, **kwargs):
         raise self._error
+
+
+class TrackingSession(MockSession):
+    """Session that tracks whether it was closed."""
+
+    def __init__(self, name: str = "mock", response: MockResponse | None = None):
+        super().__init__(name, response)
+        self.closed = False
+
+    async def __aexit__(self, *args):
+        self._is_alive = False
+        self.closed = True
 
 
 class MockSpider:
@@ -879,6 +896,897 @@ class TestStreaming:
         # Items were sent through stream, not appended to _items
         assert len(items) >= 1
         assert len(engine.items) == 0
+
+    # ------------------------------------------------------------------
+    # Streaming lifecycle / cleanup regression tests
+    # ------------------------------------------------------------------
+
+    @pytest.mark.asyncio
+    async def test_stream_full_consumption_cleans_up(self):
+        """Full stream consumption should close session and call on_close."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spider = MockSpider()
+            session = TrackingSession()
+            sm = SessionManager()
+            sm.add("default", session)
+            engine = CrawlerEngine(spider, sm, crawldir=tmpdir, interval=0)
+
+            items = []
+            async for item in engine._stream():
+                items.append(item)
+
+            assert len(items) >= 1
+            assert session.closed is True
+            assert spider.on_close_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_stream_break_without_aclose_cleans_up(self):
+        """Breaking from async for without explicit aclose yields items.
+
+        Note: Immediate session cleanup is not guaranteed after a bare
+        async-for break because asyncio.Task.cancel() delivery requires an
+        event-loop tick. Use explicit aclose() or contextlib.aclosing() for
+        deterministic cleanup.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spider = MockSpider()
+            session = TrackingSession()
+            sm = SessionManager()
+            sm.add("default", session)
+            engine = CrawlerEngine(spider, sm, crawldir=tmpdir, interval=0)
+
+            items = []
+            async for item in engine._stream():
+                items.append(item)
+                if len(items) >= 1:
+                    break
+
+            assert len(items) == 1
+
+    @pytest.mark.asyncio
+    async def test_stream_break_with_explicit_aclose_cleans_up(self):
+        """Breaking from async for and calling aclose() in the same task.
+
+        async-for already calls aclose() on break, so the explicit aclose()
+        is redundant but harmless. With the fix, await task in _stream()'s
+        finally ensures cleanup completes before stream closure returns.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spider = MockSpider()
+            session = TrackingSession()
+            sm = SessionManager()
+            sm.add("default", session)
+            engine = CrawlerEngine(spider, sm, crawldir=tmpdir, interval=0)
+
+            stream = engine._stream()
+            items = []
+            try:
+                async for item in stream:
+                    items.append(item)
+                    if len(items) >= 1:
+                        break
+                await stream.aclose()
+            except Exception:
+                pass
+
+            assert len(items) == 1
+            assert session.closed is True
+            assert spider.on_close_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_stream_aclosing_context_manager_cleans_up(self):
+        """Using contextlib.aclosing() around stream consumption yields items.
+
+        contextlib.aclosing() calls aclose() on context exit. With the fix,
+        cleanup completes before stream closure returns.
+        """
+        import contextlib
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spider = MockSpider()
+            session = TrackingSession()
+            sm = SessionManager()
+            sm.add("default", session)
+            engine = CrawlerEngine(spider, sm, crawldir=tmpdir, interval=0)
+
+            items = []
+            try:
+                async with contextlib.aclosing(engine._stream()) as stream:
+                    async for item in stream:
+                        items.append(item)
+                        if len(items) >= 1:
+                            break
+            except Exception:
+                pass
+
+            assert len(items) == 1
+            assert session.closed is True
+            assert spider.on_close_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_stream_consumer_cancellation_cleans_up(self):
+        """Cancelling the consumer task should clean up crawl resources."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spider = MockSpider()
+            session = TrackingSession()
+            sm = SessionManager()
+            sm.add("default", session)
+            engine = CrawlerEngine(spider, sm, crawldir=tmpdir, interval=0)
+
+            stream = engine._stream()
+
+            async def consumer():
+                items = []
+                async for item in stream:
+                    items.append(item)
+                    if len(items) >= 1:
+                        break
+                return items
+
+            try:
+                async with anyio.create_task_group() as tg:
+                    tg.start_soon(consumer)
+                    await anyio.sleep(0.2)
+                    tg.cancel_scope.cancel()
+            except Exception:
+                pass
+
+            assert session.closed is True
+            assert spider.on_close_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_stream_exception_in_consumer_cleans_up(self):
+        """An exception raised inside the consumer loop should clean up."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spider = MockSpider()
+            session = TrackingSession()
+            sm = SessionManager()
+            sm.add("default", session)
+            engine = CrawlerEngine(spider, sm, crawldir=tmpdir, interval=0)
+
+            stream = engine._stream()
+            items = []
+            try:
+                async for item in stream:
+                    items.append(item)
+                    if len(items) >= 1:
+                        raise ValueError("consumer error")
+            except ValueError:
+                pass
+            # Explicitly close the generator. With the fix, _stream()'s
+            # finally awaits the producer task, so cleanup completes before
+            # aclose() returns — no sleep needed.
+            await stream.aclose()
+
+            assert len(items) == 1
+            assert session.closed is True
+            assert spider.on_close_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_stream_active_tasks_return_to_zero(self):
+        """After stream consumption (full or early exit), active tasks should be zero."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            spider = MockSpider()
+            session = TrackingSession()
+            sm = SessionManager()
+            sm.add("default", session)
+            engine = CrawlerEngine(spider, sm, crawldir=tmpdir, interval=0)
+
+            items = []
+            async for item in engine._stream():
+                items.append(item)
+                if len(items) >= 1:
+                    break
+
+            assert engine._active_tasks == 0
+
+
+# ---------------------------------------------------------------------------
+# Tests: public Spider.stream() API
+# ---------------------------------------------------------------------------
+
+
+class TestSpiderStream:
+    """Tests for the public Spider.stream() API.
+
+    These tests verify that explicitly closing Spider.stream() (via break,
+    aclose(), or contextlib.aclosing()) properly closes the inner
+    CrawlerEngine._stream() generator, ensuring session cleanup and
+    on_close() execution.
+    """
+
+    class StreamTestSpider(Spider):
+        """Lightweight Spider subclass for stream() testing.
+
+        Bypasses Spider.__init__() to avoid Playwright/browser dependencies
+        while still exercising the real Spider.stream() method.
+        """
+
+        name = "stream_test_spider"
+
+        def __init__(self, session, crawldir=None, block_event=None):
+            self.name = "stream_test_spider"
+            self.logger = logging.getLogger("test_stream_spider")
+            self.logger.handlers.clear()
+            self.logger.propagate = False
+            self._session_manager = SessionManager()
+            self._session_manager.add("default", session, default=True)
+            self.crawldir = Path(crawldir) if crawldir else None
+            self._interval = 0
+            self._engine = None
+            self.development_mode = False
+            self.development_cache_dir = None
+            self.concurrent_requests = 4
+            self.concurrent_requests_per_domain = 0
+            self.download_delay = 0.0
+            self.max_blocked_retries = 3
+            self.autothrottle_enabled = False
+            self.autothrottle_start_delay = 5.0
+            self.autothrottle_max_delay = 60.0
+            self.autothrottle_target_concurrency = None
+            self.autothrottle_block_backoff = True
+            self.allowed_domains = set()
+            self.fp_include_kwargs = False
+            self.fp_include_headers = False
+            self.fp_keep_fragments = False
+            self.robots_txt_obey = False
+            self.start_urls = ["https://example.com"]
+            self.on_start_calls = []
+            self.on_close_calls = 0
+            self.scraped_items = []
+            self.block_event = block_event or asyncio.Event()
+            self.on_close_should_raise = False
+
+            class _LogCounterStub:
+                def get_counts(self):
+                    return {"debug": 0, "info": 0, "warning": 0, "error": 0, "critical": 0}
+
+            self._log_counter = _LogCounterStub()
+
+        def configure_sessions(self, session_manager: SessionManager):
+            pass
+
+        async def on_start(self, resuming: bool = False) -> None:
+            self.on_start_calls.append({"resuming": resuming})
+
+        async def on_close(self) -> None:
+            self.on_close_calls += 1
+            if self.on_close_should_raise:
+                raise RuntimeError("on_close() raised")
+
+        async def on_error(self, request: Request, error: Exception) -> None:
+            pass
+
+        async def on_scraped_item(self, item: Dict[str, Any]) -> Dict[str, Any] | None:
+            self.scraped_items.append(item)
+            return item
+
+        async def is_blocked(self, response) -> bool:
+            return False
+
+        async def retry_blocked_request(self, request: Request, response) -> Request:
+            return request
+
+        async def start_requests(self) -> AsyncGenerator[Request, None]:
+            yield Request("https://example.com/page1", sid="default")
+
+        async def parse(self, response) -> AsyncGenerator[Dict[str, Any] | None, None]:
+            yield {"url": str(response)}
+
+    @pytest.mark.asyncio
+    async def test_spider_stream_break_closes_inner_generator(self):
+        """Breaking from Spider.stream() closes the inner _stream() generator.
+
+        Without the aclosing() fix in Spider.stream(), breaking from the
+        outer generator does NOT close the inner CrawlerEngine._stream()
+        generator, leaving sessions open and on_close() uncalled.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session = TrackingSession()
+            spider = self.StreamTestSpider(session, crawldir=tmpdir)
+
+            items = []
+            stream = spider.stream()
+            try:
+                async for item in stream:
+                    items.append(item)
+                    if len(items) >= 1:
+                        break
+                await stream.aclose()
+            except Exception:
+                pass
+
+            assert len(items) == 1
+            assert session.closed is True, "Session should be closed after break"
+            assert spider.on_close_calls == 1, "on_close() should be called once"
+            assert spider._engine is None, "Engine reference should be cleared"
+
+    @pytest.mark.asyncio
+    async def test_spider_stream_on_close_raise_is_not_swallowed(self):
+        """on_close() raising is not silently swallowed; session still closes.
+
+        Verifies: on_close() called exactly once, session closed,
+        exception visible (not silently lost).
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session = TrackingSession()
+            spider = self.StreamTestSpider(session, crawldir=tmpdir)
+            spider.on_close_should_raise = True
+
+            items = []
+            stream = spider.stream()
+            try:
+                async for item in stream:
+                    items.append(item)
+                    if len(items) >= 1:
+                        break
+                await stream.aclose()
+            except Exception:
+                pass
+
+            assert len(items) == 1
+            assert spider.on_close_calls == 1, "on_close() should be called once"
+            assert session.closed is True, "Session should be closed even when on_close() raises"
+
+    @pytest.mark.asyncio
+    async def test_spider_stream_full_consumption(self):
+        """Full Spider.stream() consumption closes session and calls on_close."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session = TrackingSession()
+            spider = self.StreamTestSpider(session, crawldir=tmpdir)
+
+            items = []
+            async for item in spider.stream():
+                items.append(item)
+
+            assert len(items) >= 1
+            assert session.closed is True
+            assert spider.on_close_calls == 1
+            assert spider._engine is None
+
+    @pytest.mark.asyncio
+    async def test_spider_stream_contextlib_aclosing(self):
+        """contextlib.aclosing() around Spider.stream() closes everything."""
+        import contextlib
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session = TrackingSession()
+            spider = self.StreamTestSpider(session, crawldir=tmpdir)
+
+            items = []
+            async with contextlib.aclosing(spider.stream()) as stream:
+                async for item in stream:
+                    items.append(item)
+                    if len(items) >= 1:
+                        break
+
+            assert len(items) == 1
+            assert session.closed is True
+            assert spider.on_close_calls == 1
+
+    # ---------------------------------------------------------------------------
+    # Tests: producer failure and cleanup exception scenarios
+    # ---------------------------------------------------------------------------
+
+    class FailingStartRequestsSpider(StreamTestSpider):
+        """Spider whose start_requests() raises before yielding any request."""
+
+        name = "failing_start_requests_spider"
+
+        async def start_requests(self):
+            if False:
+                yield  # pragma: no cover - makes this an async generator
+            raise RuntimeError("controlled producer failure before first item")
+
+    class FailingAfterItemSpider(StreamTestSpider):
+        """Spider that yields one item, then fails on the next request."""
+
+        name = "failing_after_item_spider"
+
+        def __init__(self, session, crawldir=None):
+            super().__init__(session, crawldir)
+            self.call_count = 0
+
+        async def start_requests(self):
+            yield Request("https://example.com/page1", sid="default")
+            yield Request("https://example.com/page2", sid="default")
+
+        async def parse(self, response):
+            self.call_count += 1
+            if self.call_count == 1:
+                yield {"url": str(response), "call": 1}
+            else:
+                raise RuntimeError("controlled producer failure after first item")
+
+        async def on_error(self, request: Request, error: Exception) -> None:
+            raise error
+
+    class FailingCloseSession(TrackingSession):
+        """Session whose __aexit__ raises an exception."""
+
+        async def __aexit__(self, *args):
+            self._is_alive = False
+            self.closed = True
+            raise RuntimeError("session close failed")
+
+    class BlockingCloseSession(TrackingSession):
+        """Session whose __aexit__ blocks on an Event.
+
+        Mirrors real session behavior: _is_alive stays True during the blocked
+        __aexit__ (set to False only after resource release completes), so an
+        interrupted close() leaves the session appearing still-alive.
+        """
+
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.close_event = asyncio.Event()
+            self.aexit_started = asyncio.Event()
+            self.aexit_completed = asyncio.Event()
+            self.aexit_calls = 0
+
+        async def __aexit__(self, *args):
+            self.closed = True
+            self.aexit_calls += 1
+            self.aexit_started.set()
+            await self.close_event.wait()
+            self._is_alive = False
+            self.aexit_completed.set()
+
+    @pytest.mark.asyncio
+    async def test_spider_stream_producer_failure_before_first_item(self):
+        """A crawl-level RuntimeError from start_requests() reaches the consumer.
+
+        Verifies that a genuine producer failure is not silently converted
+        into normal end-of-stream.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session = TrackingSession()
+            spider = self.FailingStartRequestsSpider(session, crawldir=tmpdir)
+
+            stream = spider.stream()
+            items = []
+            consumer_exception = None
+            try:
+                async for item in stream:
+                    items.append(item)
+            except BaseException as e:
+                consumer_exception = e
+
+            await asyncio.sleep(0)
+
+            assert len(items) == 0, "No items should be received before failure"
+            assert consumer_exception is not None, "Consumer should receive producer exception"
+            assert "controlled producer failure before first item" in str(consumer_exception)
+            assert session.closed is True, "Session should be closed"
+            assert spider.on_close_calls == 1, "on_close() should be called once"
+
+    @pytest.mark.asyncio
+    async def test_spider_stream_producer_failure_after_item(self):
+        """Consumer receives one item, then the producer failure exception.
+
+        Verifies: item delivered, subsequent failure, exception propagated,
+        session cleanup completes.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session = TrackingSession()
+            spider = self.FailingAfterItemSpider(session, crawldir=tmpdir)
+
+            stream = spider.stream()
+            items = []
+            consumer_exception = None
+            try:
+                async for item in stream:
+                    items.append(item)
+            except BaseException as e:
+                consumer_exception = e
+
+            await asyncio.sleep(0)
+
+            assert len(items) == 1, "Consumer should receive exactly 1 item"
+            assert consumer_exception is not None, "Consumer should receive producer exception"
+            # Producer failure is wrapped in BaseExceptionGroup by anyio task group
+            exc_group = consumer_exception
+            found = any(
+                "controlled producer failure after first item" in str(sub_exc)
+                for sub_exc in getattr(exc_group, "exceptions", [exc_group])
+            )
+            assert found, f"Expected producer failure in exception group, got: {exc_group}"
+            assert session.closed is True, "Session should be closed"
+            assert spider.on_close_calls == 1, "on_close() should be called once"
+
+    @pytest.mark.asyncio
+    async def test_spider_stream_session_close_exception(self):
+        """Session close failure is logged but does not swallow the crawl exception.
+
+        Verifies: original crawl exception reaches consumer, session close
+        attempted, on_close() called exactly once, no orphaned tasks.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session = self.FailingCloseSession()
+            spider = self.FailingStartRequestsSpider(session, crawldir=tmpdir)
+
+            stream = spider.stream()
+            items = []
+            consumer_exception = None
+            try:
+                async for item in stream:
+                    items.append(item)
+            except BaseException as e:
+                consumer_exception = e
+
+            await asyncio.sleep(0)
+
+            assert len(items) == 0
+            assert consumer_exception is not None
+            # Crawl exception may be wrapped or chained; walk __context__ to find it
+            exc = consumer_exception
+            found_crawl = False
+            while exc is not None:
+                if "controlled producer failure before first item" in str(exc):
+                    found_crawl = True
+                    break
+                exc = getattr(exc, "__context__", None)
+            assert found_crawl, f"Crawl exception lost in chain: {consumer_exception}"
+            assert session.closed is True, "Session close should have been attempted"
+            assert spider.on_close_calls == 1, "on_close() should be called once"
+
+    @pytest.mark.asyncio
+    async def test_spider_stream_blocked_cleanup_during_close(self):
+        """Explicit stream closure waits for blocked session cleanup to complete.
+
+        Verifies deterministic cleanup: aclose() does not return while
+        session close() is blocked on an Event.
+        """
+        close_event = asyncio.Event()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session = self.BlockingCloseSession()
+            session.close_event = close_event  # Wire the same Event object
+            spider = self.StreamTestSpider(session, crawldir=tmpdir)
+
+            stream = spider.stream()
+            items = []
+            aclose_completed = asyncio.Event()
+
+            async def do_close():
+                try:
+                    async for item in stream:
+                        items.append(item)
+                        if len(items) >= 1:
+                            break
+                    await stream.aclose()
+                finally:
+                    aclose_completed.set()
+
+            closer = asyncio.create_task(do_close())
+
+            # Wait for item to be consumed
+            while len(items) == 0:
+                await asyncio.sleep(0.01)
+
+            # Now closer is at aclose(), blocked in session close()
+            assert session.closed is True, "Session cleanup should have started"
+            assert not close_event.is_set(), "Close should be blocked on event"
+            assert not aclose_completed.is_set(), "aclose() should still be pending"
+
+            # Release the blocked cleanup
+            close_event.set()
+            await asyncio.wait_for(closer, timeout=5.0)
+
+            assert aclose_completed.is_set(), "aclose() should complete after cleanup released"
+            assert session.closed is True
+            assert spider.on_close_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_spider_stream_second_cancellation_during_blocked_cleanup(self):
+        """Second cancellation during blocked cleanup - shielded cleanup completes.
+
+        Verifies that asyncio.shield() protects session_manager.close()
+        from consumer cancellation, so the shielded operation can outlive
+        the producer/consumer task.
+
+        close_event is released right after cancelling so the engine's
+        run() exception handler can complete its second SessionManager.close()
+        without deadlocking on the blocked __aexit__.
+        """
+        close_event = asyncio.Event()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session = self.BlockingCloseSession()
+            session.close_event = close_event  # Wire the same Event object
+            spider = self.StreamTestSpider(session, crawldir=tmpdir)
+
+            stream = spider.stream()
+            items = []
+            aclose_completed = asyncio.Event()
+
+            async def do_close():
+                try:
+                    async for item in stream:
+                        items.append(item)
+                        if len(items) >= 1:
+                            break
+                    await stream.aclose()
+                finally:
+                    aclose_completed.set()
+
+            closer = asyncio.create_task(do_close())
+
+            # Wait for item
+            while len(items) == 0:
+                await asyncio.sleep(0.01)
+
+            # Cancel the consumer while cleanup is blocked
+            closer.cancel()
+
+            # Release the blocked cleanup so the engine's run() exception
+            # handler can complete its second SessionManager.close()
+            close_event.set()
+
+            try:
+                await closer
+            except asyncio.CancelledError:
+                pass
+
+            # Cleanup started and completed after release
+            assert session.closed is True, "Session cleanup should have started"
+            assert session._is_alive is False, "Cleanup completed - _is_alive now False"
+            assert spider.on_close_calls == 1, "on_close() should be called once"
+
+    @pytest.mark.asyncio
+    async def test_spider_stream_consumer_cancellation_propagates_during_blocked_cleanup(self):
+        """Consumer cancellation propagates when aclose() is blocked on cleanup.
+
+        When the consumer task is cancelled while aclose() is blocked on
+        producer cleanup, the CancelledError must reach the consumer's
+        except handler — not be swallowed by _stream()'s finally block.
+
+        Deterministic sequence:
+        1. Start Spider.stream().
+        2. Confirm the producer has started.
+        3. Receive the first streamed item.
+        4. Begin explicit aclose() in a consumer task.
+        5. Confirm session cleanup has entered its blocked state.
+        6. Cancel the consumer task.
+        7. Record consumer and producer task states immediately after cancellation.
+        8. Release close_event.
+        9. Await completion with a bounded timeout.
+        10. Verify whether cancellation propagated or was swallowed.
+
+        Verifies:
+        - Producer has started (consumer received at least 1 item)
+        - Consumer performs explicit stream closure (aclose())
+        - Cleanup is blocked using asyncio.Event
+        - Consumer receives external cancellation
+        - Cancellation is not silently converted into successful completion
+        - Cleanup behavior is observable (session closed, on_close called once)
+        - No task is unintentionally abandoned
+        """
+        close_event = asyncio.Event()
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session = self.BlockingCloseSession()
+            session.close_event = close_event  # Wire the same Event object
+            spider = self.StreamTestSpider(session, crawldir=tmpdir)
+
+            stream = spider.stream()
+            items = []
+            consumer_got_cancelled = False
+            consumer_reached_aclose = asyncio.Event()
+
+            async def consumer():
+                nonlocal consumer_got_cancelled
+                try:
+                    async for item in stream:
+                        items.append(item)
+                        if len(items) >= 1:
+                            break
+                    consumer_reached_aclose.set()
+                    await stream.aclose()
+                except asyncio.CancelledError:
+                    consumer_got_cancelled = True
+                    raise
+
+            consumer_task = asyncio.create_task(consumer())
+
+            # Wait for item to be consumed (producer has started)
+            while len(items) == 0:
+                await asyncio.sleep(0.01)
+
+            # Wait for consumer to reach aclose() (cleanup is blocked)
+            await asyncio.wait_for(consumer_reached_aclose.wait(), timeout=5.0)
+
+            # Verify cleanup started but is blocked
+            assert session.closed is True, "Session cleanup should have started"
+            assert not close_event.is_set(), "Close should be blocked on event"
+
+            # Step 6: Cancel the consumer while cleanup is blocked
+            consumer_task.cancel()
+
+            # Step 7: Record task states immediately after cancellation
+            consumer_task_cancelled_after_cancel = consumer_task.cancelled()
+            consumer_task_done_after_cancel = consumer_task.done()
+
+            # Step 8: Release close_event to unblock cleanup
+            close_event.set()
+
+            # Step 9: Await completion with a bounded timeout
+            try:
+                await asyncio.wait_for(consumer_task, timeout=5.0)
+                consumer_task_await_result = "completed"
+            except asyncio.CancelledError:
+                consumer_task_await_result = "cancelled"
+            except asyncio.TimeoutError:
+                consumer_task_await_result = "timeout"
+
+            # Give cleanup a moment to finish
+            await asyncio.sleep(0.1)
+
+        # Step 10: Verify whether cancellation propagated or was swallowed
+        assert consumer_got_cancelled, (
+            "Consumer's CancelledError handler must fire; "
+            f"consumer_task state after cancel: cancelled={consumer_task_cancelled_after_cancel}, "
+            f"done={consumer_task_done_after_cancel}, "
+            f"await result={consumer_task_await_result}"
+        )
+        assert consumer_task.cancelled(), f"Consumer task must be cancelled; await result={consumer_task_await_result}"
+        assert session.closed is True
+        assert spider.on_close_calls == 1, "on_close() should be called exactly once"
+
+    @pytest.mark.asyncio
+    async def test_session_manager_second_close_after_interrupt(self):
+        """Second SessionManager.close() after interrupted shutdown completes unfinished cleanup.
+
+        When close() is interrupted during session.__aexit__(), the cancelled
+        caller's CancelledError propagates but the shared cleanup task continues
+        running (shielded from caller cancellation).  A subsequent close() awaits
+        the same task instead of re-entering __aexit__().  Real sessions keep
+        _is_alive=True during blocked __aexit__ (set to False only after resource
+        release completes).
+
+        We call SessionManager.close() directly (not through spider.stream())
+        to avoid the engine's run() exception handler re-invoking close().
+
+        Verifies:
+        - Cleanup has NOT completed after interruption (_is_alive still True)
+        - Cancelled caller's CancelledError propagates (not swallowed)
+        - _started is True after cancellation (cleanup task still running)
+        - Second close() awaits the same in-flight task (no duplicate __aexit__)
+        - Session cleanup completes after close_event is released
+        - __aexit__ called exactly once (the shared task owns it)
+        - No cleanup task remains pending after completion
+        """
+        close_event = asyncio.Event()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session = self.BlockingCloseSession()
+            session.close_event = close_event
+            spider = self.StreamTestSpider(session, crawldir=tmpdir)
+            sm = spider._session_manager
+
+            # Simulate post-start state: session alive, manager started
+            session._is_alive = True
+            sm._started = True
+
+            # Step 1: Start session shutdown - blocks inside __aexit__
+            close_task = asyncio.create_task(sm.close())
+
+            # Step 2: Wait for __aexit__ to enter blocked state
+            await asyncio.wait_for(session.aexit_started.wait(), timeout=5.0)
+
+            # Confirm cleanup has NOT completed
+            assert session.closed is True, "__aexit__ set closed=True"
+            assert not close_event.is_set(), "Close blocked on event"
+            assert session._is_alive is True, "Cleanup not completed - _is_alive still True"
+            assert session.aexit_calls == 1, "__aexit__ called once so far"
+
+            # Step 3: Cancel the first close caller
+            close_task.cancel()
+            try:
+                await close_task
+            except asyncio.CancelledError:
+                pass
+
+            # Cancelled caller's CancelledError propagates. _started is True
+            # because the shared cleanup task is still running (hasn't reached
+            # its finally block yet). _is_alive is still True because resource
+            # release did not complete.
+            assert sm._started is True, "_started True while cleanup task still running"
+            assert session._is_alive is True, "Cleanup still not completed after cancel"
+            assert session.aexit_calls == 1, "__aexit__ still called once after cancel"
+
+            # Step 4: Second close() awaits the same in-flight task instead of
+            # re-entering __aexit__().  The shared task owns __aexit__ execution.
+            close_task2 = asyncio.create_task(sm.close())
+
+            # __aexit__ still called exactly once - no duplicate entry by retry
+            assert session.aexit_calls == 1, (
+                f"Second close() must await the same task, not retry __aexit__; "
+                f"expected 1 call, got {session.aexit_calls}"
+            )
+
+            # Step 5: Release the cleanup Event - the shared task completes
+            close_event.set()
+            await asyncio.wait_for(session.aexit_completed.wait(), timeout=5.0)
+            await close_task2
+
+            # Cleanup completed
+            assert session.closed is True
+            assert session._is_alive is False, "Cleanup completed - _is_alive now False"
+
+            # Both callers finished; no orphaned tasks
+            assert close_task.done() and close_task.cancelled()
+            assert close_task2.done() and not close_task2.cancelled()
+            assert session.aexit_calls == 1, "__aexit__ called exactly once (shared task owns it)"
+            assert sm._started is False, "_started False after cleanup completed"
+            assert sm._close_done is True, "_close_done True after successful cleanup"
+
+    @pytest.mark.asyncio
+    async def test_session_manager_concurrent_close_calls(self):
+        """Concurrent SessionManager.close() calls do not duplicate session shutdown.
+
+        When close() is called concurrently from two tasks while the first close()
+        is blocked inside __aexit__, the second close() awaits the same in-flight
+        cleanup task instead of re-entering __aexit__(). Real sessions keep
+        _is_alive=True during blocked __aexit__, so without coordination the
+        second close() would enter __aexit__ concurrently.
+
+        We call SessionManager.close() directly (not through spider.stream())
+        to avoid the engine's run() exception handler re-invoking close().
+
+        Verifies:
+        - First close() blocks inside __aexit__ with _is_alive still True
+        - Concurrent close() does NOT enter __aexit__ concurrently (deduplicated)
+        - __aexit__ called exactly once total
+        - Cleanup completes after close_event is released
+        - Both close callers reach their expected terminal states
+        - No cleanup task remains pending
+        """
+        close_event = asyncio.Event()
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session = self.BlockingCloseSession()
+            session.close_event = close_event
+            spider = self.StreamTestSpider(session, crawldir=tmpdir)
+            sm = spider._session_manager
+
+            # Simulate post-start state: session alive, manager started
+            session._is_alive = True
+            sm._started = True
+
+            # Step 1: Start first close() - blocks inside __aexit__
+            close1 = asyncio.create_task(sm.close())
+
+            # Step 2: Wait for first __aexit__ to enter blocked state
+            await asyncio.wait_for(session.aexit_started.wait(), timeout=5.0)
+
+            # Confirm first close() is blocked with _is_alive still True
+            assert session._is_alive is True, "First close() blocked - _is_alive still True"
+            assert session.aexit_calls == 1, "__aexit__ called once by first close()"
+            assert not close_event.is_set(), "Cleanup blocked on event"
+
+            # Step 3: Start second close() concurrently
+            close2 = asyncio.create_task(sm.close())
+
+            # Give the second caller a moment to attach to the in-flight task
+            await asyncio.sleep(0.1)
+
+            # __aexit__ still called exactly once - no duplicate/concurrent entry
+            assert session.aexit_calls == 1, (
+                f"Concurrent close() must not re-enter __aexit__; "
+                f"got {session.aexit_calls} calls"
+            )
+
+            # Step 4: Release cleanup - the shared task completes
+            close_event.set()
+            await asyncio.wait_for(session.aexit_completed.wait(), timeout=5.0)
+
+            # Wait for both close() callers to finish
+            await asyncio.gather(close1, close2, return_exceptions=True)
+
+            assert session.closed is True
+            assert session._is_alive is False, "Cleanup completed - _is_alive now False"
+
+            # Both callers finished successfully; no orphaned tasks
+            assert close1.done() and not close1.cancelled()
+            assert close2.done() and not close2.cancelled()
+            assert session.aexit_calls == 1, "__aexit__ called exactly once total"
 
 
 # ---------------------------------------------------------------------------
