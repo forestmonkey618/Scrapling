@@ -15,6 +15,17 @@ from scrapling.fetchers import AsyncStealthySession, FetcherSession
 Session = FetcherSession | AsyncStealthySession
 
 
+def _task_cancelling(task: asyncio.Task | None) -> int | None:
+    """Return ``task.cancelling()``, or ``None`` if the task cannot report it.
+
+    ``asyncio.Task.cancelling()`` was added in Python 3.11.  A Python 3.10 task
+    keeps no count of pending cancellation requests, so ``None`` means
+    "unknown", not "none pending".
+    """
+    cancelling = getattr(task, "cancelling", None)
+    return cancelling() if cancelling is not None else None
+
+
 class SessionManager:
     """Manages pre-configured session instances."""
 
@@ -170,7 +181,9 @@ class SessionManager:
             except BaseException as task_error:
                 # The shared task completed with a non-cancellation error.
                 # If our caller was also cancelled, cancellation takes priority.
-                if asyncio.current_task().cancelling() > 0:
+                # Python 3.10 cannot report a pending cancellation request (no
+                # Task.cancelling()), so there the task error is re-raised.
+                if _task_cancelling(asyncio.current_task()):
                     raise asyncio.CancelledError() from task_error
                 raise
             # _do_close() stores errors in _close_error instead of raising,
