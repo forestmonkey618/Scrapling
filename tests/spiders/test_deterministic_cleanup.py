@@ -959,3 +959,80 @@ class TestFailedCleanupFollowedByRetry:
         assert manager._close_error is None
         assert session.exit_calls == 2, "__aexit__ retried on second close()"
         assert not session._is_alive, "Session closed after successful retry"
+
+
+class TestSharedCleanupTaskFailure:
+    """A close() caller joins a shared cleanup task that fails outright.
+
+    _do_close() stores session errors in _close_error instead of raising, so
+    this branch of close() is only reached when the shared task itself fails.
+    The caller must then see that failure, or its own cancellation where the
+    interpreter can report one.
+
+    Both callers run in tasks made by asyncio.create_task().  On Python 3.10
+    pytest-asyncio drives the test function in a backported Task that has
+    cancelling(); ordinary tasks, the ones applications get, do not.
+    """
+
+    @staticmethod
+    def _manager_joining_failed_cleanup() -> SessionManager:
+        async def failing_cleanup():
+            raise RuntimeError("shared cleanup task failed")
+
+        manager = SessionManager()
+        manager.add("default", TrackingSession())
+        # Another caller already owns the cleanup, and that cleanup fails.
+        manager._close_task = asyncio.create_task(failing_cleanup())
+        return manager
+
+    @pytest.mark.asyncio
+    async def test_joining_caller_observes_shared_task_failure(self):
+        manager = self._manager_joining_failed_cleanup()
+
+        caller = asyncio.create_task(manager.close())
+
+        with pytest.raises(RuntimeError, match="shared cleanup task failed"):
+            await asyncio.wait_for(caller, timeout=5.0)
+
+    @pytest.mark.asyncio
+    async def test_cancelled_caller_joining_failed_shared_task(self):
+        """Cancellation takes priority over the task failure wherever it can be detected.
+
+        The caller runs close() while handling its own cancellation.  With
+        Task.cancelling() (Python 3.11+) close() raises CancelledError and keeps
+        the failure as its cause.  Python 3.10 cannot tell that the caller is
+        being cancelled, so close() re-raises the failure itself: it is never lost.
+        """
+        manager = self._manager_joining_failed_cleanup()
+        parked = asyncio.Event()
+        observed: dict = {}
+
+        async def caller():
+            observed["can_report_cancellation"] = hasattr(asyncio.current_task(), "cancelling")
+            try:
+                parked.set()
+                await asyncio.Event().wait()
+            except asyncio.CancelledError:
+                try:
+                    await manager.close()
+                except BaseException as exc:
+                    observed["close_raised"] = exc
+                    raise
+                raise
+
+        task = asyncio.create_task(caller())
+        await asyncio.wait_for(parked.wait(), timeout=5.0)
+        task.cancel()
+        await asyncio.wait({task}, timeout=5.0)
+
+        assert task.done()
+        raised = observed.get("close_raised")
+        if observed["can_report_cancellation"]:
+            assert isinstance(raised, asyncio.CancelledError)
+            assert isinstance(raised.__cause__, RuntimeError)
+            assert "shared cleanup task failed" in str(raised.__cause__)
+            assert task.cancelled()
+        else:
+            assert isinstance(raised, RuntimeError)
+            assert "shared cleanup task failed" in str(raised)
+            assert task.exception() is raised
