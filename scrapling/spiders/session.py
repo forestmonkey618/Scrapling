@@ -15,6 +15,17 @@ from scrapling.fetchers import AsyncStealthySession, FetcherSession
 Session = FetcherSession | AsyncStealthySession
 
 
+def _task_cancelling(task: asyncio.Task | None) -> int | None:
+    """Return ``task.cancelling()``, or ``None`` if the task cannot report it.
+
+    ``asyncio.Task.cancelling()`` was added in Python 3.11.  A Python 3.10 task
+    keeps no count of pending cancellation requests, so ``None`` means
+    "unknown", not "none pending".
+    """
+    cancelling = getattr(task, "cancelling", None)
+    return cancelling() if cancelling is not None else None
+
+
 class SessionManager:
     """Manages pre-configured session instances."""
 
@@ -167,11 +178,13 @@ class SessionManager:
                 # task continues running (shielded) and its completion state
                 # (_close_done, _close_error) is managed by the task itself.
                 raise
-            except BaseException as error:
+            except BaseException as task_error:
                 # The shared task completed with a non-cancellation error.
                 # If our caller was also cancelled, cancellation takes priority.
-                if asyncio.current_task().cancelling() > 0:
-                    raise asyncio.CancelledError() from error
+                # Python 3.10 cannot report a pending cancellation request (no
+                # Task.cancelling()), so there the task error is re-raised.
+                if _task_cancelling(asyncio.current_task()):
+                    raise asyncio.CancelledError() from task_error
                 raise
             # _do_close() stores errors in _close_error instead of raising,
             # so shield() completes normally even when cleanup failed.  Check
@@ -196,9 +209,7 @@ class SessionManager:
                         # after an interrupted __aexit__ it stays True (set only
                         # at the very end of close()), so unfinished cleanup is
                         # never skipped on a subsequent close().
-                        if not session._is_alive and (
-                            sid in self._lazy_sessions or not was_started
-                        ):
+                        if not session._is_alive and (sid in self._lazy_sessions or not was_started):
                             continue
                         # Each session's __aexit__ runs in its own shielded scope
                         # so that cancellation triggered by one session's exit hook
@@ -216,8 +227,7 @@ class SessionManager:
                                 # session.  The error is recorded in _close_error
                                 # and propagated by close().
                                 if first_error is None or (
-                                    isinstance(first_error, Exception)
-                                    and not isinstance(error, Exception)
+                                    isinstance(first_error, Exception) and not isinstance(error, Exception)
                                 ):
                                     # Cancellation/system exceptions take priority
                                     # over ordinary failures.

@@ -46,6 +46,28 @@ from scrapling.core._types import (
 from scrapling.engines.constants import STEALTH_ARGS, HARMFUL_ARGS, DEFAULT_ARGS
 
 
+def _add_exception_note(exc: BaseException, note: str) -> None:
+    """Attach ``note`` to ``exc``, as ``exc.add_note(note)`` does on Python 3.11+.
+
+    Python 3.10 has no ``BaseException.add_note()``, so the note is appended to
+    ``exc.__notes__`` directly.  That is where ``add_note()`` keeps its notes,
+    so callers read them the same way on every supported version.
+    """
+    # getattr()/setattr() because neither name exists for type checkers on Python 3.10.
+    add_note = getattr(exc, "add_note", None)
+    if add_note is not None:
+        add_note(note)
+        return
+    notes = getattr(exc, "__notes__", None)
+    if not isinstance(notes, list):
+        notes = []
+        try:
+            setattr(exc, "__notes__", notes)
+        except (AttributeError, TypeError):
+            return  # the exception refuses new attributes; it is raised without the note
+    notes.append(note)
+
+
 class SyncSession:
     _config: "PlaywrightConfig | StealthConfig"
     _context_options: Dict[str, Any]
@@ -125,10 +147,7 @@ class SyncSession:
             primary = errors[0]
             for secondary in errors[1:]:
                 log.warning("Secondary cleanup failure during session close: %r", secondary)
-                try:
-                    primary.add_note(f"Secondary cleanup failure: {type(secondary).__name__}: {secondary}")
-                except AttributeError:
-                    pass  # Python < 3.11 does not support exception notes
+                _add_exception_note(primary, f"Secondary cleanup failure: {type(secondary).__name__}: {secondary}")
             raise primary
 
     def __enter__(self):
@@ -369,10 +388,7 @@ class AsyncSession:
             primary = errors[0]
             for secondary in errors[1:]:
                 log.warning("Secondary cleanup failure during session close: %r", secondary)
-                try:
-                    primary.add_note(f"Secondary cleanup failure: {type(secondary).__name__}: {secondary}")
-                except AttributeError:
-                    pass  # Python < 3.11 does not support exception notes
+                _add_exception_note(primary, f"Secondary cleanup failure: {type(secondary).__name__}: {secondary}")
             raise primary
 
     async def __aenter__(self):

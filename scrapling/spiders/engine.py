@@ -10,7 +10,7 @@ from anyio import create_task_group, CapacityLimiter, create_memory_object_strea
 
 from scrapling.core.utils import log
 from scrapling.spiders.scheduler import Scheduler
-from scrapling.spiders.session import SessionManager
+from scrapling.spiders.session import SessionManager, _task_cancelling
 from scrapling.spiders.request import Request, Response
 from scrapling.spiders.robotstxt import RobotsTxtManager
 from scrapling.spiders.result import CrawlStats, ItemList
@@ -25,6 +25,36 @@ if TYPE_CHECKING:
 
 def _dump(obj: Dict) -> str:
     return json.dumps(obj, indent=4)
+
+
+async def _await_producer_py310(task: asyncio.Task) -> None:
+    """Wait for the cancelled producer task where ``Task.cancelling()`` is missing.
+
+    ``CrawlerEngine._stream()`` cancels its producer and then has to tell that
+    cancellation apart from a cancellation of the consumer itself.  Awaiting
+    the task raises ``CancelledError`` for both, and only ``Task.cancelling()``
+    (Python 3.11+) can separate them afterwards.  ``asyncio.wait()`` avoids the
+    ambiguity: it raises ``CancelledError`` only when the waiting task is
+    cancelled, and the producer's own outcome is read from the task afterwards.
+    """
+    cancelled: asyncio.CancelledError | None = None
+    while not task.done():
+        try:
+            await asyncio.wait({task})
+        except asyncio.CancelledError as exc:
+            # The consumer was cancelled.  Pass the request on to the producer,
+            # as ``await task`` does implicitly, and keep waiting so that the
+            # producer is never left running unobserved.  ``await task`` passes
+            # it on at once; here that happens one loop iteration later, which
+            # only shows when both tasks are cancelled together (loop shutdown).
+            cancelled = exc
+            task.cancel()
+    if not task.cancelled():
+        task.result()  # re-raise a producer failure, as ``await task`` does
+    if cancelled is not None:
+        # Re-raise the consumer's own exception, not a new one: its message is
+        # how AnyIO recognises a cancellation delivered by one of its scopes.
+        raise cancelled
 
 
 class CrawlerEngine:
@@ -498,12 +528,17 @@ class CrawlerEngine:
                 task.cancel()
             # Always await the producer task so cleanup completes and
             # exceptions are retrieved rather than silently lost.
-            try:
-                await task
-            except asyncio.CancelledError:
-                # Propagate cancellation only if the current (consumer) task
-                # has a pending external cancellation. If cancelling() is 0,
-                # the CancelledError came from our own task.cancel() and
-                # should be swallowed so normal aclose() completes.
-                if asyncio.current_task().cancelling() > 0:
-                    raise
+            consumer = asyncio.current_task()
+            if _task_cancelling(consumer) is None:
+                # Python 3.10: there is no Task.cancelling() for the check below.
+                await _await_producer_py310(task)
+            else:
+                try:
+                    await task
+                except asyncio.CancelledError:
+                    # Propagate cancellation only if the current (consumer) task
+                    # has a pending external cancellation. If cancelling() is 0,
+                    # the CancelledError came from our own task.cancel() and
+                    # should be swallowed so normal aclose() completes.
+                    if _task_cancelling(consumer):
+                        raise

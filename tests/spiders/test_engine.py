@@ -1790,6 +1790,219 @@ class TestSpiderStream:
 
 
 # ---------------------------------------------------------------------------
+# Tests: Spider.stream() teardown inside ordinary asyncio tasks
+# ---------------------------------------------------------------------------
+
+
+@pytest.mark.usefixtures("producer_wait")
+class TestSpiderStreamTeardown:
+    """Closing or cancelling Spider.stream() from an ordinary asyncio task.
+
+    CrawlerEngine._stream() cancels its producer task when the consumer stops
+    early, then has to tell that cancellation apart from a cancellation of the
+    consumer itself.  Python 3.11+ answers with Task.cancelling(); Python 3.10
+    has no such method, so _stream() waits for the producer differently there.
+
+    Every consumer here runs in a task made by asyncio.create_task().  On
+    Python 3.10 pytest-asyncio drives the test function in a backported Task
+    that has cancelling(), which hides what applications get on Python 3.10.
+    Each test runs twice: on the path the interpreter selects, and with the
+    Python 3.10 path forced, so that every interpreter covers that path.
+    """
+
+    class SlowSession(TrackingSession):
+        """Keeps the crawl in flight while the consumer stops."""
+
+        async def fetch(self, url: str, **kwargs):
+            await asyncio.sleep(0.02)
+            return await super().fetch(url, **kwargs)
+
+    class LongCrawlSpider(TestSpiderStream.StreamTestSpider):
+        """Has far more pages than any consumer here reads."""
+
+        async def start_requests(self) -> AsyncGenerator[Request, None]:
+            for page in range(200):
+                yield Request(f"https://example.com/page{page}", sid="default")
+
+    @pytest.fixture(params=["default", "py310"])
+    def producer_wait(self, request, monkeypatch):
+        """How _stream() waits for its producer: the interpreter's own path, or the Python 3.10 path."""
+        if request.param == "py310":
+            monkeypatch.setattr("scrapling.spiders.engine._task_cancelling", lambda task: None)
+        return request.param
+
+    @staticmethod
+    def _unfinished_tasks() -> list:
+        return [task for task in asyncio.all_tasks() if task is not asyncio.current_task() and not task.done()]
+
+    @pytest.mark.asyncio
+    @pytest.mark.parametrize("how", ["aclose", "aclosing"])
+    async def test_early_close_of_running_stream_returns_cleanly(self, how):
+        """Stopping a stream whose crawl is still running finishes cleanup, then returns normally."""
+        import contextlib
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session = self.SlowSession()
+            spider = self.LongCrawlSpider(session, crawldir=tmpdir)
+            items = []
+
+            async def consumer():
+                stream = spider.stream()
+                if how == "aclose":
+                    async for item in stream:
+                        items.append(item)
+                        break
+                    await stream.aclose()
+                else:
+                    async with contextlib.aclosing(stream):
+                        async for item in stream:
+                            items.append(item)
+                            break
+
+            await asyncio.wait_for(asyncio.create_task(consumer()), timeout=5.0)
+
+            assert len(items) == 1
+            assert session.closed is True
+            assert spider.on_close_calls == 1
+            assert self._unfinished_tasks() == [], "no task may be left running"
+
+    @pytest.mark.asyncio
+    async def test_consumer_cancelled_while_iterating_ends_cancelled(self):
+        """Cancelling a consumer that is waiting for the next item cancels it, after cleanup."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session = self.SlowSession()
+            spider = self.LongCrawlSpider(session, crawldir=tmpdir)
+            got_item = asyncio.Event()
+
+            async def consumer():
+                async for _ in spider.stream():
+                    got_item.set()
+
+            task = asyncio.create_task(consumer())
+            await asyncio.wait_for(got_item.wait(), timeout=5.0)
+            task.cancel()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=5.0)
+
+            assert task.cancelled()
+            assert session.closed is True
+            assert spider.on_close_calls == 1
+            assert self._unfinished_tasks() == [], "no task may be left running"
+
+    @pytest.mark.asyncio
+    async def test_close_waits_for_blocked_cleanup(self):
+        """aclose() returns only once blocked session cleanup is released, and then returns normally."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session = TestSpiderStream.BlockingCloseSession()
+            spider = TestSpiderStream.StreamTestSpider(session, crawldir=tmpdir)
+
+            async def consumer():
+                stream = spider.stream()
+                async for _ in stream:
+                    break
+                await stream.aclose()
+
+            task = asyncio.create_task(consumer())
+            try:
+                await asyncio.wait_for(session.aexit_started.wait(), timeout=5.0)
+                await asyncio.sleep(0.05)
+                assert not task.done(), "aclose() must keep waiting while cleanup is blocked"
+            finally:
+                session.close_event.set()  # never leave cleanup blocked, even if this test fails
+            await asyncio.wait_for(task, timeout=5.0)
+
+            assert session._is_alive is False
+            assert spider.on_close_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_consumer_cancelled_during_blocked_close_ends_cancelled(self):
+        """A consumer cancelled while aclose() waits on cleanup is cancelled; it must not finish normally."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session = TestSpiderStream.BlockingCloseSession()
+            spider = TestSpiderStream.StreamTestSpider(session, crawldir=tmpdir)
+
+            async def consumer():
+                stream = spider.stream()
+                async for _ in stream:
+                    break
+                await stream.aclose()
+
+            task = asyncio.create_task(consumer())
+            try:
+                await asyncio.wait_for(session.aexit_started.wait(), timeout=5.0)
+                task.cancel()
+            finally:
+                session.close_event.set()  # never leave cleanup blocked, even if this test fails
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(task, timeout=5.0)
+
+            assert task.cancelled()
+            await asyncio.wait_for(session.aexit_completed.wait(), timeout=5.0)
+            assert session._is_alive is False
+            assert spider.on_close_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_producer_failure_during_early_close_reaches_consumer(self):
+        """An error the producer raises while it shuts down is raised to the consumer, never dropped."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session = self.SlowSession()
+            spider = self.LongCrawlSpider(session, crawldir=tmpdir)
+            spider.on_close_should_raise = True
+
+            async def consumer():
+                stream = spider.stream()
+                async for _ in stream:
+                    break
+                await stream.aclose()
+
+            task = asyncio.create_task(consumer())
+            with pytest.raises(RuntimeError, match=r"on_close\(\) raised"):
+                await asyncio.wait_for(task, timeout=5.0)
+
+            assert session.closed is True
+            assert spider.on_close_calls == 1
+
+    @pytest.mark.asyncio
+    async def test_cancel_scope_releases_consumer_while_cleanup_is_blocked(self):
+        """A cancelled AnyIO scope ends the consumer although session cleanup has not finished.
+
+        AnyIO repeats a scope's cancellation until the task leaves the scope, and
+        recognises its own CancelledError by the message on it.  So the consumer
+        must pass every request on to the producer, and must re-raise the error
+        it was given; otherwise a timeout around the stream could never fire.
+        """
+        with tempfile.TemporaryDirectory() as tmpdir:
+            session = TestSpiderStream.BlockingCloseSession()
+            spider = TestSpiderStream.StreamTestSpider(session, crawldir=tmpdir)
+            scope = anyio.CancelScope()
+
+            async def consumer():
+                with scope:
+                    stream = spider.stream()
+                    async for _ in stream:
+                        break
+                    await stream.aclose()
+
+            task = asyncio.create_task(consumer())
+            try:
+                await asyncio.wait_for(session.aexit_started.wait(), timeout=5.0)
+                scope.cancel()
+                finished, _ = await asyncio.wait({task}, timeout=5.0)
+
+                assert finished, "the consumer must leave the cancelled scope while cleanup is still blocked"
+                assert session._is_alive is True, "cleanup has not finished yet"
+            finally:
+                session.close_event.set()  # never leave cleanup blocked, even if this test fails
+                await asyncio.wait({task}, timeout=5.0)
+
+            assert not task.cancelled() and task.exception() is None, "the scope absorbs its own cancellation"
+            assert scope.cancelled_caught is True
+            await asyncio.wait_for(session.aexit_completed.wait(), timeout=5.0)
+            assert session._is_alive is False, "the shared cleanup still completes"
+            assert spider.on_close_calls == 1
+
+
+# ---------------------------------------------------------------------------
 # Tests: pause during crawl
 # ---------------------------------------------------------------------------
 
