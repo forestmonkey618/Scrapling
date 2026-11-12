@@ -12,7 +12,7 @@ from unittest.mock import AsyncMock, Mock
 
 import pytest
 
-from scrapling.engines._browsers._base import AsyncSession, SyncSession
+from scrapling.engines._browsers._base import AsyncSession, SyncSession, _add_exception_note
 
 
 def _make_session(asynchronous: bool = False):
@@ -236,3 +236,55 @@ class TestAsyncSessionClose:
         notes = getattr(exc_info.value, "__notes__", []) or []
         assert any("browser close failed" in note for note in notes)
         assert any("playwright stop failed" in note for note in notes)
+
+
+class TestAddExceptionNote:
+    """``_add_exception_note()`` must work where ``BaseException.add_note()`` does not exist.
+
+    ``add_note()`` arrived in Python 3.11.  ``_WithoutAddNote`` behaves like a
+    Python 3.10 exception on every interpreter, so the fallback is exercised
+    by the whole test matrix and not by the Python 3.10 job alone.
+    """
+
+    class _WithoutAddNote(Exception):
+        add_note = None
+
+    def test_note_is_stored_when_add_note_is_missing(self):
+        exc = self._WithoutAddNote("primary")
+
+        _add_exception_note(exc, "first")
+        _add_exception_note(exc, "second")
+
+        assert exc.__notes__ == ["first", "second"]
+
+    def test_existing_notes_are_kept(self):
+        exc = self._WithoutAddNote("primary")
+        exc.__notes__ = ["already here"]
+
+        _add_exception_note(exc, "added")
+
+        assert exc.__notes__ == ["already here", "added"]
+
+    def test_add_note_is_used_when_the_exception_provides_it(self):
+        calls = []
+
+        class WithAddNote(Exception):
+            def add_note(self, note):
+                calls.append(note)
+
+        _add_exception_note(WithAddNote("primary"), "secondary")
+
+        assert calls == ["secondary"]
+
+    def test_exception_refusing_attributes_is_left_untouched(self):
+        """Attaching a note is best effort: it must never raise in place of the primary error."""
+
+        class Frozen(self._WithoutAddNote):
+            def __setattr__(self, name, value):
+                raise AttributeError(name)
+
+        exc = Frozen("primary")
+
+        _add_exception_note(exc, "dropped")
+
+        assert getattr(exc, "__notes__", None) is None
