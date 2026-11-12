@@ -167,11 +167,11 @@ class SessionManager:
                 # task continues running (shielded) and its completion state
                 # (_close_done, _close_error) is managed by the task itself.
                 raise
-            except BaseException as error:
+            except BaseException as task_error:
                 # The shared task completed with a non-cancellation error.
                 # If our caller was also cancelled, cancellation takes priority.
                 if asyncio.current_task().cancelling() > 0:
-                    raise asyncio.CancelledError() from error
+                    raise asyncio.CancelledError() from task_error
                 raise
             # _do_close() stores errors in _close_error instead of raising,
             # so shield() completes normally even when cleanup failed.  Check
