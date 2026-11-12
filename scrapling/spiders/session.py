@@ -196,9 +196,7 @@ class SessionManager:
                         # after an interrupted __aexit__ it stays True (set only
                         # at the very end of close()), so unfinished cleanup is
                         # never skipped on a subsequent close().
-                        if not session._is_alive and (
-                            sid in self._lazy_sessions or not was_started
-                        ):
+                        if not session._is_alive and (sid in self._lazy_sessions or not was_started):
                             continue
                         # Each session's __aexit__ runs in its own shielded scope
                         # so that cancellation triggered by one session's exit hook
@@ -216,8 +214,7 @@ class SessionManager:
                                 # session.  The error is recorded in _close_error
                                 # and propagated by close().
                                 if first_error is None or (
-                                    isinstance(first_error, Exception)
-                                    and not isinstance(error, Exception)
+                                    isinstance(first_error, Exception) and not isinstance(error, Exception)
                                 ):
                                     # Cancellation/system exceptions take priority
                                     # over ordinary failures.
