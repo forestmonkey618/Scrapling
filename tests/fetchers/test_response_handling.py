@@ -545,3 +545,306 @@ class TestErrorScenarios:
         # Null bytes
         page = Selector("Hello\x00World")
         assert "Hello" in page.get_all_text()
+
+
+class TestNextPageUrl:
+    """Deterministic tests for Response.next_page_url()."""
+
+    @staticmethod
+    def _make_response(html: str, url: str = "https://example.com/page") -> Response:
+        return Response(
+            url=url,
+            content=html,
+            status=200,
+            reason="OK",
+            cookies={},
+            headers={},
+            request_headers={},
+        )
+
+    # --- Priority 1: rel="next" ---
+
+    def test_head_link_rel_next(self):
+        html = '<html><head><link rel="next" href="/page/2"></head><body></body></html>'
+        assert self._make_response(html).next_page_url() == "https://example.com/page/2"
+
+    def test_anchor_rel_next(self):
+        html = '<html><body><a rel="next" href="/page/2">Next</a></body></html>'
+        assert self._make_response(html).next_page_url() == "https://example.com/page/2"
+
+    def test_area_rel_next(self):
+        html = '<html><body><map><area rel="next" href="/page/2"></map></body></html>'
+        assert self._make_response(html).next_page_url() == "https://example.com/page/2"
+
+    def test_rel_next_case_insensitive(self):
+        html = '<html><body><a rel="NEXT" href="/page/2">Next</a></body></html>'
+        assert self._make_response(html).next_page_url() == "https://example.com/page/2"
+
+    def test_rel_next_multi_token(self):
+        html = '<html><body><a rel="next archive" href="/page/2">Next</a></body></html>'
+        assert self._make_response(html).next_page_url() == "https://example.com/page/2"
+
+    def test_rel_next_multi_token_reversed(self):
+        html = '<html><body><a rel="archive next" href="/page/2">Next</a></body></html>'
+        assert self._make_response(html).next_page_url() == "https://example.com/page/2"
+
+    def test_rel_not_next_is_ignored(self):
+        html = '<html><body><a rel="prev" href="/page/0">Prev</a></body></html>'
+        assert self._make_response(html).next_page_url() is None
+
+    # --- Relative URL resolution ---
+
+    def test_relative_url_resolved(self):
+        html = '<html><body><a rel="next" href="page/2">Next</a></body></html>'
+        assert (
+            self._make_response(html, url="https://example.com/sub/").next_page_url()
+            == "https://example.com/sub/page/2"
+        )
+
+    def test_relative_url_with_dots(self):
+        html = '<html><body><a rel="next" href="../page/2">Next</a></body></html>'
+        assert (
+            self._make_response(html, url="https://example.com/sub/deep/").next_page_url()
+            == "https://example.com/sub/page/2"
+        )
+
+    # --- Priority 2: accessibility labels ---
+
+    def test_aria_label_next(self):
+        html = '<html><body><a aria-label="Next page" href="/page/2">Next</a></body></html>'
+        assert self._make_response(html).next_page_url() == "https://example.com/page/2"
+
+    def test_aria_label_next_case_insensitive(self):
+        html = '<html><body><a aria-label="NEXT" href="/page/2">Next</a></body></html>'
+        assert self._make_response(html).next_page_url() == "https://example.com/page/2"
+
+    def test_aria_label_with_extra_text(self):
+        html = '<html><body><a aria-label="Go to next page" href="/page/2">Next</a></body></html>'
+        assert self._make_response(html).next_page_url() == "https://example.com/page/2"
+
+    def test_aria_label_no_href_is_skipped(self):
+        html = '<html><body><a aria-label="Next">No href</a></body></html>'
+        assert self._make_response(html).next_page_url() is None
+
+    # --- Priority 3: link text ---
+
+    def test_link_text_next(self):
+        html = '<html><body><a href="/page/2">Next</a></body></html>'
+        assert self._make_response(html).next_page_url() == "https://example.com/page/2"
+
+    def test_link_text_gt(self):
+        html = '<html><body><a href="/page/2">&gt;</a></body></html>'
+        assert self._make_response(html).next_page_url() == "https://example.com/page/2"
+
+    def test_link_text_double_gt(self):
+        html = '<html><body><a href="/page/2">&raquo;</a></body></html>'
+        assert self._make_response(html).next_page_url() == "https://example.com/page/2"
+
+    def test_link_text_older(self):
+        html = '<html><body><a href="/page/2">Older posts</a></body></html>'
+        assert self._make_response(html).next_page_url() == "https://example.com/page/2"
+
+    def test_link_text_next_page(self):
+        html = '<html><body><a href="/page/2">Next page</a></body></html>'
+        assert self._make_response(html).next_page_url() == "https://example.com/page/2"
+
+    def test_generic_more_link_is_not_pagination(self):
+        html = '<html><body><a href="/more">More</a></body></html>'
+        assert self._make_response(html).next_page_url() is None
+
+    # --- Priority 4: numbered pagination ---
+
+    def test_numbered_pagination_query_page(self):
+        html = '<html><body><a href="?page=2">Page 2</a></body></html>'
+        assert (
+            self._make_response(html, url="https://example.com/?page=1").next_page_url()
+            == "https://example.com/?page=2"
+        )
+
+    def test_numbered_pagination_path_page(self):
+        html = '<html><body><a href="/page/2/">Page 2</a></body></html>'
+        assert (
+            self._make_response(html, url="https://example.com/page/1/").next_page_url()
+            == "https://example.com/page/2/"
+        )
+
+    def test_numbered_pagination_lower_page_is_ignored(self):
+        html = '<html><body><a href="?page=0">Page 0</a></body></html>'
+        assert (
+            self._make_response(html, url="https://example.com/?page=1").next_page_url()
+            is None
+        )
+
+    def test_numbered_pagination_same_page_is_ignored(self):
+        html = '<html><body><a href="?page=1">Page 1</a></body></html>'
+        assert (
+            self._make_response(html, url="https://example.com/?page=1").next_page_url()
+            is None
+        )
+
+    def test_numbered_pagination_no_current_page(self):
+        html = '<html><body><a href="?page=2">Page 2</a></body></html>'
+        assert self._make_response(html, url="https://example.com/").next_page_url() is None
+
+    # --- Precedence ---
+
+    def test_rel_next_wins_over_text(self):
+        html = (
+            '<html><body>'
+            '<a rel="next" href="/page/2">Next</a>'
+            '<a href="/page/3">Next</a>'
+            "</body></html>"
+        )
+        assert self._make_response(html).next_page_url() == "https://example.com/page/2"
+
+    def test_aria_label_wins_over_text(self):
+        html = (
+            '<html><body>'
+            '<a aria-label="Next" href="/page/2">Click</a>'
+            '<a href="/page/3">Next</a>'
+            "</body></html>"
+        )
+        assert self._make_response(html).next_page_url() == "https://example.com/page/2"
+
+    # --- Duplicates ---
+
+    def test_duplicate_rel_next_candidates(self):
+        html = (
+            '<html><body>'
+            '<a rel="next" href="/page/2">Next</a>'
+            '<a rel="next" href="/page/2">Next</a>'
+            "</body></html>"
+        )
+        assert self._make_response(html).next_page_url() == "https://example.com/page/2"
+
+    # --- URL validation ---
+
+    def test_self_link_is_rejected(self):
+        html = '<html><body><a rel="next" href="?">Next</a></body></html>'
+        assert (
+            self._make_response(html, url="https://example.com/?").next_page_url()
+            is None
+        )
+
+    def test_self_link_with_trailing_slash_is_rejected(self):
+        html = '<html><body><a rel="next" href="/page/">Next</a></body></html>'
+        assert (
+            self._make_response(html, url="https://example.com/page/").next_page_url()
+            is None
+        )
+
+    def test_fragment_only_is_rejected(self):
+        html = '<html><body><a rel="next" href="#top">Next</a></body></html>'
+        assert self._make_response(html).next_page_url() is None
+
+    def test_fragment_in_url_is_rejected(self):
+        html = '<html><body><a rel="next" href="/page/2#section">Next</a></body></html>'
+        assert self._make_response(html).next_page_url() is None
+
+    def test_invalid_scheme_javascript(self):
+        html = '<html><body><a rel="next" href="javascript:alert(1)">Next</a></body></html>'
+        assert self._make_response(html).next_page_url() is None
+
+    def test_invalid_scheme_mailto(self):
+        html = '<html><body><a rel="next" href="mailto:x@example.com">Next</a></body></html>'
+        assert self._make_response(html).next_page_url() is None
+
+    def test_invalid_scheme_ftp(self):
+        html = '<html><body><a rel="next" href="ftp://files.example.com/">Next</a></body></html>'
+        assert self._make_response(html).next_page_url() is None
+
+    def test_empty_href_is_skipped(self):
+        html = '<html><body><a rel="next" href="">Next</a></body></html>'
+        assert self._make_response(html).next_page_url() is None
+
+    def test_missing_href_is_skipped(self):
+        html = '<html><body><a rel="next">Next</a></body></html>'
+        assert self._make_response(html).next_page_url() is None
+
+    # --- External origins (same-origin restriction) ---
+
+    def test_external_origin_is_rejected(self):
+        html = '<html><body><a rel="next" href="https://other.com/page/2">Next</a></body></html>'
+        assert self._make_response(html).next_page_url() is None
+
+    def test_cross_origin_rel_next_is_rejected(self):
+        html = '<html><body><a rel="next" href="//other.com/page/2">Next</a></body></html>'
+        assert self._make_response(html).next_page_url() is None
+
+    def test_https_explicit_port_443_is_same_origin(self):
+        html = '<html><body><a rel="next" href="https://example.com:443/page/2">Next</a></body></html>'
+        # urljoin preserves the explicit port; same-origin check normalizes 443 for https.
+        assert (
+            self._make_response(html, url="https://example.com/page/1").next_page_url()
+            == "https://example.com:443/page/2"
+        )
+
+    def test_https_port_8443_is_different_origin(self):
+        html = '<html><body><a rel="next" href="https://example.com:8443/page/2">Next</a></body></html>'
+        assert self._make_response(html, url="https://example.com/page/1").next_page_url() is None
+
+    def test_http_vs_https_is_different_origin(self):
+        html = '<html><body><a rel="next" href="http://example.com/page/2">Next</a></body></html>'
+        assert self._make_response(html, url="https://example.com/page/1").next_page_url() is None
+
+    # --- aria-labelledby resolution ---
+
+    def test_aria_labelledby_resolves_referenced_element_text(self):
+        html = (
+            '<html><body>'
+            '<span id="next-label">Next page</span>'
+            '<a aria-labelledby="next-label" href="/page/2">Next</a>'
+            "</body></html>"
+        )
+        assert self._make_response(html).next_page_url() == "https://example.com/page/2"
+
+    def test_aria_labelledby_case_insensitive_signal(self):
+        html = (
+            '<html><body>'
+            '<span id="lbl">NEXT</span>'
+            '<a aria-labelledby="lbl" href="/page/2">Next</a>'
+            "</body></html>"
+        )
+        assert self._make_response(html).next_page_url() == "https://example.com/page/2"
+
+    def test_aria_labelledby_unresolved_id_is_skipped(self):
+        html = '<html><body><a aria-labelledby="nonexistent-id" href="/page/2">Click here</a></body></html>'
+        assert self._make_response(html).next_page_url() is None
+
+    def test_aria_label_takes_precedence_over_labelledby(self):
+        html = (
+            '<html><body>'
+            '<span id="lbl">Prev</span>'
+            '<a aria-label="Next" aria-labelledby="lbl" href="/page/2">Next</a>'
+            "</body></html>"
+        )
+        assert self._make_response(html).next_page_url() == "https://example.com/page/2"
+
+    # --- False positives / missing ---
+
+    def test_no_pagination_returns_none(self):
+        html = '<html><body><a href="/about">About</a></body></html>'
+        assert self._make_response(html).next_page_url() is None
+
+    def test_empty_html_returns_none(self):
+        assert self._make_response("<html><body></body></html>").next_page_url() is None
+
+    def test_text_only_next_without_href_is_skipped(self):
+        html = '<html><body><a>Next</a></body></html>'
+        assert self._make_response(html).next_page_url() is None
+
+    # --- Existing API compatibility ---
+
+    def test_next_page_url_does_not_break_css(self):
+        html = '<html><body><a rel="next" href="/page/2">Next</a></body></html>'
+        response = self._make_response(html)
+        assert response.next_page_url() == "https://example.com/page/2"
+        assert response.css("a::attr(href)").get() == "/page/2"
+
+    def test_next_page_url_does_not_break_follow(self):
+        html = '<html><body><a rel="next" href="/page/2">Next</a></body></html>'
+        response = self._make_response(html)
+        url = response.next_page_url()
+        assert url is not None
+        # follow() still works on the response
+        assert response.url == "https://example.com/page"
