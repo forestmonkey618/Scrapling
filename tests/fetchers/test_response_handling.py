@@ -990,3 +990,123 @@ class TestNextPageUrlMalformedCandidates:
         for href in ("/list?page=2", "http://[::1]:8080/list?page=2"):
             assert self._detect(_BODY_PAGE, _REL_NEXT_LINK, url, href) == "http://[::1]:8080/list?page=2"
         assert self._detect(_BODY_PAGE, _REL_NEXT_LINK, url, "http://[::1]:9090/list?page=2") is None
+
+
+# int() refuses decimal strings longer than the interpreter's integer string conversion limit
+# (4300 digits by default), so a page number this long cannot be converted to an integer.
+OVERSIZED_PAGE_NUMBER = "9" * 5000
+
+# One URL template per shape that numbered pagination recognises ("page {n} of the listing").
+NUMBERED_PAGE_URLS = [
+    pytest.param("https://example.com/list?page={n}", id="page-query"),
+    pytest.param("https://example.com/list?p={n}", id="p-query"),
+    pytest.param("https://example.com/list/page/{n}/", id="page-path"),
+]
+
+
+class TestNextPageUrlOversizedPageNumbers:
+    """Response.next_page_url() ignores page numbers that are too long for int() instead of raising."""
+
+    _make_response = staticmethod(TestNextPageUrl._make_response)
+
+    @classmethod
+    def _detect(cls, url: str, *hrefs: str):
+        # The link text is not a next-page keyword, so only numbered pagination can match
+        links = "".join(f'<a href="{href}">more</a>' for href in hrefs)
+        return cls._make_response(_BODY_PAGE.format(links=links), url=url).next_page_url()
+
+    def test_int_refuses_the_oversized_number(self):
+        # Precondition of the tests below: the number really is longer than int() accepts
+        with pytest.raises(ValueError):
+            int(OVERSIZED_PAGE_NUMBER)
+
+    # --- Ordinary numbered pagination is unchanged ---
+
+    @pytest.mark.parametrize("page_url", NUMBERED_PAGE_URLS)
+    def test_ordinary_page_numbers_are_still_detected(self, page_url):
+        page = page_url.format
+        assert self._detect(page(n=2), page(n=1), page(n=2), page(n=3), page(n=4)) == page(n=3)
+        assert self._detect(page(n=2), page(n=1), page(n=2)) is None
+
+    @pytest.mark.parametrize("page_url", NUMBERED_PAGE_URLS)
+    def test_page_numbers_are_still_compared_as_numbers(self, page_url):
+        page = page_url.format
+        # 10 follows 9 as a number, although "10" sorts before "9" as text
+        assert self._detect(page(n=9), page(n=8), page(n=10)) == page(n=10)
+        assert self._detect(page(n=10), page(n=9)) is None
+        # Leading zeros do not change the number
+        assert self._detect(page(n="07"), page(n="007"), page(n="08")) == page(n="08")
+
+    @pytest.mark.parametrize("page_url", NUMBERED_PAGE_URLS)
+    def test_long_page_numbers_that_int_accepts_are_still_detected(self, page_url):
+        page = page_url.format
+        # 600 digits: far beyond any real page number, but int() never refuses a number this short
+        current, following = "1" + "0" * 599, "1" + "0" * 598 + "1"
+        assert self._detect(page(n=current), page(n=following)) == page(n=following)
+        assert self._detect(page(n=following), page(n=current)) is None
+
+    # --- Oversized number in the response URL ---
+
+    @pytest.mark.parametrize("page_url", NUMBERED_PAGE_URLS)
+    def test_oversized_number_in_response_url_yields_none(self, page_url):
+        page = page_url.format
+        # The current page number is unknown, so numbered links cannot be ranked against it
+        assert self._detect(page(n=OVERSIZED_PAGE_NUMBER), page(n=2), page(n=3)) is None
+        assert self._detect(page(n=OVERSIZED_PAGE_NUMBER), page(n=OVERSIZED_PAGE_NUMBER + "9"), page(n=3)) is None
+
+    @pytest.mark.parametrize("page_url", NUMBERED_PAGE_URLS)
+    def test_explicit_signals_still_work_when_the_response_url_number_is_oversized(self, page_url):
+        url = page_url.format(n=OVERSIZED_PAGE_NUMBER)
+        for link in (_REL_NEXT_LINK, _ARIA_LABEL_LINK, _TEXT_LINK):
+            html = _BODY_PAGE.format(links=link.format(href="/list?page=3"))
+            assert self._make_response(html, url=url).next_page_url() == "https://example.com/list?page=3"
+
+    # --- Oversized number in a candidate link ---
+
+    @pytest.mark.parametrize("page_url", NUMBERED_PAGE_URLS)
+    def test_oversized_candidate_is_skipped(self, page_url):
+        page = page_url.format
+        assert self._detect(page(n=1), page(n=OVERSIZED_PAGE_NUMBER)) is None
+
+    @pytest.mark.parametrize("page_url", NUMBERED_PAGE_URLS)
+    def test_valid_candidate_after_oversized_one_is_returned(self, page_url):
+        page = page_url.format
+        result = self._detect(page(n=1), page(n=OVERSIZED_PAGE_NUMBER), page(n=2))
+        assert result == page(n=2)
+        assert type(result) is str
+
+    @pytest.mark.parametrize("page_url", NUMBERED_PAGE_URLS)
+    def test_first_valid_candidate_in_document_order_wins_around_oversized_ones(self, page_url):
+        page = page_url.format
+        hrefs = (page(n=OVERSIZED_PAGE_NUMBER), page(n=3), page(n=OVERSIZED_PAGE_NUMBER + "9"), page(n=4))
+        assert self._detect(page(n=2), *hrefs) == page(n=3)
+
+    @pytest.mark.parametrize("page_url", NUMBERED_PAGE_URLS)
+    def test_other_rules_still_apply_after_an_oversized_candidate(self, page_url):
+        page = page_url.format
+        rejected = (
+            page(n=OVERSIZED_PAGE_NUMBER),
+            page(n=1),  # lower page number
+            page(n=2),  # the current page
+            page(n=3).replace("https://example.com", "https://other.example"),  # cross-origin
+            page(n=3).replace("https://", "http://"),  # other scheme, so another origin
+            page(n=3).replace("example.com", "example.com:8443"),  # other port, so another origin
+            page(n=3) + "#top",  # URL with a fragment
+        )
+        assert self._detect(page(n=2), *rejected) is None
+        assert self._detect(page(n=2), *rejected, page(n=3)) == page(n=3)
+
+    def test_oversized_number_is_not_replaced_by_a_lower_priority_pattern(self):
+        # ``page=`` outranks ``/page/N/``: when its number is unusable, the URL has no usable page number
+        oversized_query = f"?page={OVERSIZED_PAGE_NUMBER}"
+        assert self._detect(f"https://example.com/list/page/2/{oversized_query}", "/list/page/3/") is None
+        assert self._detect("https://example.com/list/page/2/", f"/list/page/3/{oversized_query}") is None
+
+    # --- Explicit signals never interpret the page number ---
+
+    @pytest.mark.parametrize("page_url", NUMBERED_PAGE_URLS)
+    def test_explicit_signal_link_with_an_oversized_number_is_returned_unchanged(self, page_url):
+        href = page_url.format(n=OVERSIZED_PAGE_NUMBER)
+        for link in (_REL_NEXT_LINK, _ARIA_LABEL_LINK, _TEXT_LINK):
+            html = _BODY_PAGE.format(links=link.format(href=href))
+            assert self._make_response(html, url=page_url.format(n=1)).next_page_url() == href

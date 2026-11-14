@@ -53,11 +53,16 @@ _PAGE_NUMBER_URL_PATTERNS = (
 
 
 def _extract_page_number(url: str) -> Optional[int]:
-    """Extract a page number from a URL, or ``None`` if no page pattern is found."""
+    """Extract a page number from a URL, or ``None`` if no usable page number is found."""
     for pattern in _PAGE_NUMBER_URL_PATTERNS:
         match = pattern.search(url)
         if match:
-            return int(match.group(1))
+            try:
+                return int(match.group(1))
+            except ValueError:
+                # ``int()`` refuses digit strings longer than Python's integer string conversion
+                # limit (4300 digits by default); a number that long is not a usable page number.
+                return None
     return None
 
 
