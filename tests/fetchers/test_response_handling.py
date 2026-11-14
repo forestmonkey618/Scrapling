@@ -1110,3 +1110,151 @@ class TestNextPageUrlOversizedPageNumbers:
         for link in (_REL_NEXT_LINK, _ARIA_LABEL_LINK, _TEXT_LINK):
             html = _BODY_PAGE.format(links=link.format(href=href))
             assert self._make_response(html, url=page_url.format(n=1)).next_page_url() == href
+
+
+# ``aria-labelledby`` IDs that lxml refuses to look up: it raises ``ValueError`` for an XPath string holding a
+# control character (other than tab, LF and CR), U+FFFE or U+FFFF. Each entry is the ID as written in the markup,
+# raw or as a character reference, and the ID the HTML parser makes of it. Every ID is the label ID used by the
+# tests below (``next-label``) plus one such character, so it would resolve if the character were merely dropped.
+INVALID_LABEL_IDS = [
+    pytest.param(("next-label\x01", "next-label\x01"), id="control-char-raw"),
+    pytest.param(("next-label&#1;", "next-label\x01"), id="control-char-reference"),
+    pytest.param(("next-label\x1b", "next-label\x1b"), id="esc-raw"),
+    pytest.param(("next-label&#x1B;", "next-label\x1b"), id="esc-reference"),
+    pytest.param(("next-label\ufffe", "next-label\ufffe"), id="U+FFFE-raw"),
+    pytest.param(("next-label&#xFFFE;", "next-label\ufffe"), id="U+FFFE-reference"),
+    pytest.param(("next-label\uffff", "next-label\uffff"), id="U+FFFF-raw"),
+    pytest.param(("next-label&#xFFFF;", "next-label\uffff"), id="U+FFFF-reference"),
+]
+
+
+class TestNextPageUrlInvalidAriaLabelledby:
+    """Response.next_page_url() ignores aria-labelledby IDs that lxml cannot look up instead of raising."""
+
+    _make_response = staticmethod(TestNextPageUrl._make_response)
+
+    @pytest.fixture(params=INVALID_LABEL_IDS)
+    def invalid_id(self, request):
+        """An ID that lxml refuses to look up, as written in the markup.
+
+        The test is skipped where the HTML parser does not keep the character, as the ID then never reaches lxml.
+        """
+        markup, parsed = request.param
+        response = self._make_response(_BODY_PAGE.format(links=f'<a aria-labelledby="{markup}">go</a>'))
+        if response.css("a")[0].attrib["aria-labelledby"] != parsed:
+            pytest.skip("this HTML parser does not keep the character")
+        return markup
+
+    @staticmethod
+    def _labelled_link(ids: str, href: str = "/list?page=2") -> str:
+        # The link text is not a next-page keyword, so the link can only be found through its label
+        return f'<a aria-labelledby="{ids}" href="{href}">go</a>'
+
+    @classmethod
+    def _detect(cls, *links: str, url: str = _PLAIN_URL):
+        # <body id="next-label"> is the only label on the page, and its text starts with "Next page"
+        return cls._make_response(_LABELLED_PAGE.format(links="".join(links)), url=url).next_page_url()
+
+    def test_looking_up_the_invalid_id_raises(self, invalid_id):
+        # Precondition of the tests below: this is the lookup that next_page_url() makes for the ID
+        response = self._make_response(_LABELLED_PAGE.format(links=self._labelled_link(invalid_id)))
+        parsed_id = str(response.css("a")[0].attrib["aria-labelledby"])
+        with pytest.raises(ValueError):
+            response.xpath("*[@id=$ref_id]", ref_id=parsed_id)
+
+    # --- Valid references are unchanged ---
+
+    def test_valid_references_still_resolve(self):
+        assert self._detect(self._labelled_link("next-label", "/list?page=3")) == "https://example.com/list?page=3"
+        assert self._detect('<map><area aria-labelledby="next-label" href="/list?page=3"></map>') == (
+            "https://example.com/list?page=3"
+        )
+        # Several IDs: the ones that match no element are ignored
+        several = self._labelled_link("missing next-label other", "/list?page=3")
+        assert self._detect(several) == "https://example.com/list?page=3"
+        assert self._detect(self._labelled_link("missing")) is None
+
+    # --- The invalid reference is ignored ---
+
+    def test_link_with_an_invalid_reference_is_not_a_candidate(self, invalid_id):
+        assert self._detect(self._labelled_link(invalid_id)) is None
+        assert self._detect(self._labelled_link(f"{invalid_id} {invalid_id}")) is None
+        assert self._detect(f'<map><area aria-labelledby="{invalid_id}" href="/list?page=2"></map>') is None
+
+    def test_invalid_reference_on_a_link_without_href_is_ignored(self, invalid_id):
+        without_href = f'<a aria-labelledby="{invalid_id}">go</a>'
+        assert self._detect(without_href) is None
+        valid = self._labelled_link("next-label", "/list?page=3")
+        assert self._detect(without_href, valid) == "https://example.com/list?page=3"
+
+    def test_valid_reference_beside_an_invalid_one_still_resolves(self, invalid_id):
+        # An ID that cannot be looked up is ignored, like an ID that matches no element
+        for ids in (f"{invalid_id} next-label", f"next-label {invalid_id}"):
+            assert self._detect(self._labelled_link(ids, "/list?page=3")) == "https://example.com/list?page=3"
+
+    # --- Later candidates are still considered ---
+
+    def test_valid_candidate_after_an_invalid_one_is_returned(self, invalid_id):
+        invalid = self._labelled_link(invalid_id, "/a")
+        result = self._detect(invalid, self._labelled_link("next-label", "/list?page=3"))
+        assert result == "https://example.com/list?page=3"
+        assert type(result) is str
+        assert self._detect(invalid, _ARIA_LABEL_LINK.format(href="/list?page=4")) == "https://example.com/list?page=4"
+
+    def test_first_valid_candidate_in_document_order_wins_around_invalid_ones(self, invalid_id):
+        invalid = self._labelled_link(invalid_id, "/a")
+        first = self._labelled_link("next-label", "/list?page=3")
+        second = self._labelled_link("next-label", "/list?page=4")
+        assert self._detect(invalid, first, invalid, second) == "https://example.com/list?page=3"
+
+    def test_lower_priority_signals_still_work_after_an_invalid_reference(self, invalid_id):
+        invalid = self._labelled_link(invalid_id, "/a")
+        # Link text
+        assert self._detect(invalid, _TEXT_LINK.format(href="/list?page=3")) == "https://example.com/list?page=3"
+        # Numbered pagination
+        numbered = '<a href="/list?page=2">more</a>'
+        assert self._detect(invalid, numbered, url=_NUMBERED_URL) == "https://example.com/list?page=2"
+
+    def test_link_with_an_invalid_reference_still_matches_lower_priority_signals(self, invalid_id):
+        # Only the label is unusable: the link's own text and URL are still considered
+        by_text = f'<a aria-labelledby="{invalid_id}" href="/list?page=3">Next</a>'
+        assert self._detect(by_text) == "https://example.com/list?page=3"
+        by_number = self._labelled_link(invalid_id, "/list?page=2")
+        assert self._detect(by_number, url=_NUMBERED_URL) == "https://example.com/list?page=2"
+
+    # --- Precedence and URL rules are unchanged ---
+
+    def test_precedence_is_unchanged_around_an_invalid_reference(self, invalid_id):
+        invalid = self._labelled_link(invalid_id, "/a")
+        labelled = self._labelled_link("next-label", "/list?page=3")
+        # A label outranks link text, wherever the two links are in the document
+        text = _TEXT_LINK.format(href="/list?page=4")
+        assert self._detect(invalid, text, labelled) == "https://example.com/list?page=3"
+        # rel="next" outranks a label
+        rel_next = _REL_NEXT_LINK.format(href="/list?page=5")
+        assert self._detect(invalid, labelled, rel_next) == "https://example.com/list?page=5"
+
+    def test_aria_label_still_takes_precedence_over_an_invalid_reference(self, invalid_id):
+        # aria-label is used when present, so the reference is not looked up at all
+        def link(label: str) -> str:
+            return f'<a aria-label="{label}" aria-labelledby="{invalid_id}" href="/list?page=4">go</a>'
+
+        assert self._detect(link("Next page")) == "https://example.com/list?page=4"
+        assert self._detect(link("Menu")) is None
+
+    def test_url_rules_still_apply_after_an_invalid_reference(self, invalid_id):
+        rejected_hrefs = (
+            "https://other.example/list?page=2",  # cross-origin
+            "http://example.com/list?page=2",  # other scheme, so another origin
+            "https://example.com:8443/list?page=2",  # other port, so another origin
+            "/list",  # the page itself
+            "/list?page=2#top",  # URL with a fragment
+            "javascript:void(0)",  # not HTTP(S)
+            "http://[::1/list?page=2",  # URL that cannot be parsed
+        )
+        links = [self._labelled_link(invalid_id, "/a")]
+        links += [self._labelled_link("next-label", href) for href in rejected_hrefs]
+        assert self._detect(*links) is None
+        assert self._detect(*links, self._labelled_link("next-label", "/list?page=2")) == (
+            "https://example.com/list?page=2"
+        )

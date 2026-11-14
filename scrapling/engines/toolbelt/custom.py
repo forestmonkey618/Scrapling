@@ -309,7 +309,8 @@ class Response(Selector):
         """Resolve aria-labelledby ID reference(s) to concatenated element text.
 
         ``aria-labelledby`` contains space-separated element IDs. Each referenced
-        element's text content is looked up and joined with spaces.
+        element's text content is looked up and joined with spaces. An ID that cannot
+        be looked up is ignored, like an ID that matches no element.
         """
         parts: list[str] = []
         for ref_id in str(label_id_ref).split():
@@ -317,7 +318,13 @@ class Response(Selector):
             if not ref_id:
                 continue
             # Use XPath variable binding to avoid CSS injection in the ID reference.
-            for ref_element in self.xpath("*[@id=$ref_id]", ref_id=ref_id):
+            try:
+                ref_elements = self.xpath("*[@id=$ref_id]", ref_id=ref_id)
+            except ValueError:
+                # lxml refuses a variable value that is not XML compatible (e.g. one holding a
+                # control character), so such an ID cannot be looked up; it is ignored.
+                continue
+            for ref_element in ref_elements:
                 text = str(ref_element.get_all_text(strip=True))
                 if text:
                     parts.append(text)
