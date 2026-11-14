@@ -66,6 +66,8 @@ def _origin_key(url: str) -> tuple:
 
     Default ports (80 for http, 443 for https) are normalized so that
     ``http://example.com/`` and ``http://example.com:80/`` compare equal.
+
+    :raises ValueError: If the URL's host or port cannot be parsed.
     """
     parsed = urlparse(url)
     port = parsed.port
@@ -229,6 +231,7 @@ class Response(Selector):
         4. Numbered pagination URLs whose page number exceeds the current page's number.
 
         Within each priority level, the first candidate in document order wins.
+        Candidates whose URL cannot be parsed are skipped.
 
         The method only *detects* — it does not navigate, issue network requests, or
         modify crawler state. Use :meth:`follow` to navigate to the returned URL.
@@ -344,6 +347,7 @@ class Response(Selector):
         """Resolve and validate a candidate next-page URL.
 
         Returns the absolute URL if valid, or ``None`` if it should be skipped.
+        A candidate that cannot be parsed as a URL is skipped too, rather than raising ``ValueError``.
         """
         current_url = self.url
 
@@ -356,8 +360,12 @@ class Response(Selector):
         if href == "#" or href.startswith("#"):
             return None
 
-        # Resolve relative URLs against the response URL.
-        absolute = str(self.urljoin(href))
+        # Resolve relative URLs against the response URL. ``urljoin()`` raises ``ValueError`` for a
+        # URL it cannot parse (e.g. an unbalanced IPv6 bracket); such a candidate is skipped.
+        try:
+            absolute = str(self.urljoin(href))
+        except ValueError:
+            return None
 
         # Reject empty or fragment-containing results.
         if not absolute or "#" in absolute:
@@ -368,8 +376,12 @@ class Response(Selector):
         if not (lower.startswith("http://") or lower.startswith("https://")):
             return None
 
-        # Reject cross-origin URLs (same-origin restriction).
-        if _origin_key(absolute) != _origin_key(current_url):
+        # Reject cross-origin URLs (same-origin restriction). A URL whose origin cannot be determined
+        # (e.g. an invalid port makes ``_origin_key()`` raise ``ValueError``) is never same-origin.
+        try:
+            if _origin_key(absolute) != _origin_key(current_url):
+                return None
+        except ValueError:
             return None
 
         # Reject self-links (ignore trailing slash and bare query differences).
